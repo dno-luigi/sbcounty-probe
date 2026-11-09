@@ -25,8 +25,8 @@ extraction, which would have made the first diff unreviewable.
 | `DISPATCH_R2` | R2 `sbclog` | — |
 
 Cron: `*/1 * * * *`. `scheduled()` picks its own pace — a 3-minute interval in fast
-mode (a run stored something), 15 minutes in slow mode (nothing new, data neither
-stale nor changed). `meta:rate_limited` suspends scraping for 5 minutes when a source
+mode (a run stored something), and a 3 → 6 → 12 → 15-minute backoff in slow mode
+(nothing new, data neither stale nor changed). `meta:rate_limited` suspends scraping for 5 minutes when a source
 answers 429.
 
 Records are inserted with `INSERT OR IGNORE` against a content hash, and

@@ -94,17 +94,28 @@ run, not the one in flight.
    39. Decide the denominator before touching the threshold: narrowing the roster and
    widening it are different decisions, and neither is the same as measuring against the
    codes that have reported recently.
-2. **Slow mode never varies.** It computes `Math.min(prevInterval * 2, 15 min)` then
-   `Math.max(that, 15 min)`, which is always exactly 15 minutes, so the intended backoff
-   is dead code.
+
+   **Decided 2026-11-09 (owner):** narrow the roster. `AL`, `CB`, `RC-HE`, `RC-BE` and
+   `RC-LE` are removed from `ALL_AGENCY_CODES`, so the denominator is 34 and `degraded`
+   clears on a cycle where all 34 report; widening it to the 20 unlisted `RC-*` station
+   codes was not chosen. The removal also ends the ASP.NET city query for those five,
+   and rows that arrive for them from another source are still stored but no longer
+   counted.
+2. **Slow mode never varies — fixed 2026-11-09.** It computed `Math.min(prevInterval * 2,
+   15 min)` then `Math.max(that, 15 min)`, which is always exactly 15 minutes, so the
+   intended backoff was dead code and one quiet cycle dropped straight to the slowest
+   pace. `computeSlowInterval()` now doubles the previous gap held between the fast
+   interval and the 15-minute cap, so a quiet cycle steps 3 → 6 → 12 → 15 and the
+   interval is testable rather than inlined in `scheduled()`.
 3. **The repo is public.** It was intended private. The code contains no credentials, but
    the scraper's implementation is readable by anyone, including the agencies it reads.
 4. **Rotate `GITHUB_PAT_TOKEN`.** It was printed into a chat transcript by a malformed
    inline git credential helper on 2026-11-09, and it still authenticated afterwards.
-5. **The error path still measures its retry from the run's start.** The `catch` that
-   schedules after a failure computes `now + 15 min` from when the run *began*, not when
-   it failed. Harmless at ~190 s, so it was left alone in `cbf5071`; it becomes a
-   same-minute retry loop if a failing run ever exceeds fifteen minutes.
+5. **The error path's retry was measured from the run's start — fixed 2026-11-09.** The
+   `catch` that schedules after a failure computed `now + 15 min` from when the run
+   *began*, not when it failed. Harmless at ~190 s, so it was left alone in `cbf5071`,
+   but it turns into a same-minute retry loop once a failing run outlives its window.
+   It now goes through `computeNextScrapeAt(Date.now(), 15 min)` like the success path.
 
 ## Working rules that will bite you
 

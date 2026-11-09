@@ -19,7 +19,7 @@ the front door is `START-HERE.md`.
   enforcement stay here. The charter is `docs/MIND-AUTHORITY.md` in `mind`.
 - Practical consequence: `mind` has already read this project's deployed state and will
   re-check anything you claim. Verify against the API or the live URL; do not answer
-  from memory. If you say the health endpoint reports 39 agencies, fetch it.
+  from memory. If you say the health endpoint reports 34 agencies, fetch it.
 
 ## What this is
 
@@ -34,23 +34,25 @@ frontend build.
 These look like bugs when met cold. Do not "fix" them.
 
 - **One cron, every minute** (`*/1 * * * *`). Pacing is decided inside `scheduled()`:
-  fast (3 min) when a run stored something, slow (15 min) when nothing was new and the
-  data is neither stale nor changed. Do not shorten the trigger to chase freshness —
-  the source sites rate-limit, and `meta:rate_limited` already suspends scraping for
-  five minutes when they do.
+  fast (3 min) when a run stored something, and a backoff of 3 → 6 → 12 → 15 min when
+  nothing was new and the data is neither stale nor changed (`computeSlowInterval()`).
+  Do not shorten the trigger to chase freshness — the source sites rate-limit, and
+  `meta:rate_limited` already suspends scraping for five minutes when they do.
 - **Deduplication is the content hash.** `INSERT OR IGNORE INTO dispatch_calls` keyed on
   `hash`, from `contentHash(normalized)`. A run reporting `stored: 0` is normal: it means
   nothing new. Never make emptiness disappear by dropping the hash.
 - **Retention is eight days.** `purgeOldRecords(env, 8)` deletes rows older than that on
   every run. A row count that stops growing is retention, not a stalled pipeline.
-- **The next run is scheduled from the finish time**, through `computeNextScrapeAt()`.
-  Do not rename it to `nextScrapeAt`: `scheduled()` already binds a *local*
+- **The next run is scheduled from the finish time**, through `computeNextScrapeAt()`,
+  on the success path and in the failure `catch` alike — the `catch` used to measure
+  from the run's start, which retries immediately once a failing run outlives its
+  window. Do not rename it to `nextScrapeAt`: `scheduled()` already binds a *local*
   `nextScrapeAt` from KV, which shadows a module-level function of that name and turns
   the call site into a number. That exact mistake broke every run for half an hour on
   2026-11-09.
 - **Health counters come from the payload the run produced.** `countReportingAgencies()`
   unions `aspNet`, `riverside` and `wordpress` agencies and intersects
-  `ALL_AGENCY_CODES`, because ASP.NET holds only 28 of the 39 configured codes and the
+  `ALL_AGENCY_CODES`, because ASP.NET holds only 28 of the 34 configured codes and the
   Riverside divisions arrive as `RC-*` rows from a different source. `degraded` is
   `(total - reporting) > 3`, so the counter must be comparable to that denominator.
 - **A run takes ~165–185 s**, longer than the 3-minute fast interval. That is why pacing
@@ -70,7 +72,7 @@ These look like bugs when met cold. Do not "fix" them.
 
 ```bash
 node --check worker.js
-node --test test/                       # 11 tests
+node --test test/                       # 15 tests
 npx wrangler deploy --dry-run           # config and bundle, deploys nothing
 curl -s https://watcher.ai-n.org/api/health
 ```

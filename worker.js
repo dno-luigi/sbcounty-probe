@@ -402,15 +402,21 @@ var AGENCY_GEO = {
   "RC-LE": "Lake Elsinore, CA",
   "RC-CM": "Calimesa, CA"
 };
+// The health denominator: `total_agencies` is this array's length and `degraded`
+// is (total - reporting) > 3, so a code that never returns rows keeps the flag
+// pinned on. AL, CB, RC-HE, RC-BE and RC-LE produced no rows across the whole
+// eight-day retention window; with them the ceiling was 34 of 39, which made
+// `degraded: true` structural. Dropped 2026-11-09 by the owner's decision.
+// This list also drives the ASP.NET city query, so those five are no longer
+// polled there; rows for them from another source would still be stored, just
+// not counted here.
 var ALL_AGENCY_CODES = [
   "AD",
-  "AL",
   "AP",
   "AV",
   "BA",
   "BB",
   "BL",
-  "CB",
   "CH",
   "CR",
   "FN",
@@ -439,9 +445,6 @@ var ALL_AGENCY_CODES = [
   "RC-TE",
   "RC-JV",
   "RC-Y",
-  "RC-HE",
-  "RC-BE",
-  "RC-LE",
   "RC-CM"
 ];
 var AGENCY_CENTERS = {
@@ -1220,6 +1223,21 @@ function computeNextScrapeAt(finishedAt, intervalMs) {
   return finishedAt + intervalMs;
 }
 __name(computeNextScrapeAt, "computeNextScrapeAt");
+
+/**
+ * The quiet-cycle interval: double the previous gap, held between the fast
+ * interval and the fifteen-minute cap.
+ *
+ * The old code clamped `prevInterval * 2` to 15 min and then clamped _that_ up to
+ * 15 min, so the result was 15 minutes whatever the input: one quiet cycle dropped
+ * straight to the slowest pace and the backoff was dead code. The floor is the
+ * fast interval, which makes the ramp real: 3 -> 6 -> 12 -> 15.
+ */
+function computeSlowInterval(prevIntervalMs, fastMs = 3 * 60 * 1e3, capMs = 15 * 60 * 1e3) {
+  const doubled = (Number(prevIntervalMs) || 0) * 2;
+  return Math.min(Math.max(doubled, fastMs), capMs);
+}
+__name(computeSlowInterval, "computeSlowInterval");
 async function handleHealth(env) {
   const health = await env.DISPATCH_KV.get('meta:source_health', 'json');
   const lastRun = await env.DISPATCH_KV.get('meta:last_run', 'json');
@@ -4710,8 +4728,7 @@ var index_default = {
             intervalMs = 3 * 60 * 1e3;
             mode = freshness.stale ? "fast (stale)" : "fast (count-changed)";
           } else {
-            const nextInterval = Math.min(prevInterval * 2, 15 * 60 * 1e3);
-            intervalMs = Math.max(nextInterval, 15 * 60 * 1e3);
+            intervalMs = computeSlowInterval(prevInterval);
             mode = "slow";
           }
         }
@@ -4740,7 +4757,10 @@ var index_default = {
         console.log(`Cron [${mode}] ${result.stored} new, ${result.skipped} dups` + (geoStats ? `, geo ${geoStats.updated}/${geoStats.pairs} (${geoStats.deferred} deferred)` : "") + `, next in ${result.interval_min}m`);
       } catch (err) {
         console.error("Cron failed:", err.message);
-        const nextAt = now + 15 * 60 * 1e3;
+        // Measured from the failure, not from `now` (the run's start): a run that
+        // outlives the retry window would otherwise write next_scrape into the past
+        // and the next minute's tick would start another scrape immediately.
+        const nextAt = computeNextScrapeAt(Date.now(), 15 * 60 * 1e3);
         await Promise.all([
           env.DISPATCH_KV.put("meta:last_run", JSON.stringify({
             timestamp: (/* @__PURE__ */ new Date()).toISOString(),
@@ -4756,7 +4776,8 @@ var index_default = {
 export {
   index_default as default,
   countReportingAgencies,
-  computeNextScrapeAt
+  computeNextScrapeAt,
+  computeSlowInterval
 };
 //# sourceMappingURL=worker.js.map
 
