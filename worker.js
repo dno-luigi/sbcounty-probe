@@ -1803,7 +1803,7 @@ async function handleDiscover(env) {
 __name(handleDiscover, "handleDiscover");
 var STATIC_ASSETS = {
   "/icon.svg": { content: "\"<svg xmlns=\\\"http://www.w3.org/2000/svg\\\" width=\\\"512\\\" height=\\\"512\\\" viewBox=\\\"0 0 512 512\\\"><rect width=\\\"512\\\" height=\\\"512\\\" rx=\\\"80\\\" fill=\\\"#1a1a2e\\\"/><text x=\\\"256\\\" y=\\\"340\\\" font-size=\\\"280\\\" text-anchor=\\\"middle\\\" fill=\\\"#e94560\\\" font-family=\\\"sans-serif\\\" font-weight=\\\"bold\\\">S</text></svg>\"", contentType: "image/svg+xml" },
-  "/sw.js": { content: "const CACHE = 'sb-dispatch-v1';\nconst STATIC = ['/','/index.html','/css/dashboard.css','/js/app.js','/js/cards.js','/js/map.js','/js/deepdive.js','/js/app-data.js','/manifest.json'];\nself.addEventListener('install', e => { self.skipWaiting(); e.waitUntil(caches.open(CACHE).then(c => c.addAll(STATIC).catch(() => {}))); });\nself.addEventListener('activate', e => e.waitUntil(self.clients.claim()));\nself.addEventListener('fetch', e => {\n  const url = new URL(e.request.url);\n  if (url.pathname.startsWith('/api/')) {\n    e.respondWith(fetch(e.request).then(r => { const c = r.clone(); caches.open(CACHE).then(c2 => c2.put(e.request, c)); return r; }).catch(() => caches.match(e.request)));\n  } else {\n    e.respondWith(caches.match(e.request).then(r => r || fetch(e.request).then(res => { const c = res.clone(); caches.open(CACHE).then(c2 => c2.put(e.request, c)); return res; }).catch(() => caches.match('/'))));\n  }\n});", contentType: "application/javascript" },
+  "/sw.js": { content: "const CACHE = 'sb-dispatch-v2';\nconst STATIC = ['/','/index.html','/css/dashboard.css','/js/app.js','/js/cards.js','/js/map.js','/js/deepdive.js','/js/app-data.js','/manifest.json'];\nself.addEventListener('install', e => { self.skipWaiting(); e.waitUntil(caches.open(CACHE).then(c => c.addAll(STATIC).catch(() => {}))); });\nself.addEventListener('activate', e => e.waitUntil(caches.keys().then(function(ks){return Promise.all(ks.filter(function(k){return k !== CACHE;}).map(function(k){return caches.delete(k);}));}).then(function(){return self.clients.claim();})));\nself.addEventListener('fetch', e => {\n  const url = new URL(e.request.url);\n  if (url.pathname.startsWith('/api/')) {\n    e.respondWith(fetch(e.request).then(r => { const c = r.clone(); caches.open(CACHE).then(c2 => c2.put(e.request, c)); return r; }).catch(() => caches.match(e.request)));\n  } else {\n    e.respondWith(caches.match(e.request).then(r => r || fetch(e.request).then(res => { const c = res.clone(); caches.open(CACHE).then(c2 => c2.put(e.request, c)); return res; }).catch(() => caches.match('/'))));\n  }\n});", contentType: "application/javascript" },
   "/manifest.json": { content: "{\"id\":\"/\",\"name\":\"SB County Dispatch\",\"short_name\":\"SB Dispatch\",\"description\":\"Real-time San Bernardino County dispatch calls\",\"start_url\":\"/\",\"display\":\"standalone\",\"background_color\":\"#1a1a2e\",\"theme_color\":\"#1a1a2e\",\"icons\":[{\"src\":\"/icon.svg\",\"sizes\":\"any\",\"type\":\"image/svg+xml\",\"purpose\":\"any\"},{\"src\":\"/icon.svg\",\"sizes\":\"512x512\",\"type\":\"image/svg+xml\",\"purpose\":\"maskable\"}],\"screenshots\":[{\"src\":\"/icon.svg\",\"sizes\":\"1280x720\",\"type\":\"image/svg+xml\",\"form_factor\":\"wide\",\"label\":\"SB County Dispatch Dashboard\"},{\"src\":\"/icon.svg\",\"sizes\":\"512x1024\",\"type\":\"image/svg+xml\",\"label\":\"SB County Dispatch Mobile\"}]}", contentType: "application/manifest+json" },
   "/js/app-data.js": { content: `export const APP_DATA = ${JSON.stringify(WEB_DATA)};
 `, type: "application/javascript" },
@@ -3059,6 +3059,7 @@ let userMarker = null;
 let userPulse = null;
 let userWatchId = null;
 let viewPinned = false;
+const LOCK_KEY = 'sb-map-lock';
 
 const DEFAULT_CENTER = [34.85, -117.2];
 const DEFAULT_ZOOM = 10;
@@ -3329,7 +3330,9 @@ export function initMap() {
   if (!savedView || !Number.isFinite(savedView.lat) || !Number.isFinite(savedView.lng) || !Number.isFinite(savedView.zoom)) {
     savedView = null;
   }
-  viewPinned = !!savedView;
+  let savedLock = null;
+  try { savedLock = localStorage.getItem(LOCK_KEY); } catch (e) { savedLock = null; }
+  viewPinned = savedLock === '1' || !!savedView;
   map = L.map('map', {
     zoomControl: true,
     attributionControl: false,
@@ -3347,7 +3350,12 @@ export function initMap() {
 
   // Once the user pans, zooms or picks a record, that view is theirs: the refresh
   // used to fit the whole county every sixty seconds and yank them out of it.
-  const pinView = () => { viewPinned = true; };
+  const pinView = () => {
+    if (viewPinned) return;
+    viewPinned = true;
+    try { localStorage.setItem(LOCK_KEY, '1'); } catch (e) {}
+    updateLockButton();
+  };
   map.getContainer().addEventListener('mousedown', pinView);
   map.getContainer().addEventListener('touchstart', pinView, { passive: true });
   map.getContainer().addEventListener('wheel', pinView, { passive: true });
@@ -3392,6 +3400,17 @@ export function initMap() {
     return btn;
   };
   locateControl.addTo(map);
+
+  const lockControl = L.control({ position: 'topright' });
+  lockControl.onAdd = function () {
+    const btn = L.DomUtil.create('div', 'locate-btn');
+    btn.id = 'lock-btn';
+    L.DomEvent.disableClickPropagation(btn);
+    btn.addEventListener('click', (e) => { e.stopPropagation(); toggleViewLock(); });
+    return btn;
+  };
+  lockControl.addTo(map);
+  updateLockButton();
 
   const scanDiv = document.createElement('div');
   scanDiv.className = 'map-scan-overlay';
@@ -3525,10 +3544,36 @@ export function applySearchFilter(term) {
   }
 }
 
+/** Reflect the lock state on the map control. */
+function updateLockButton() {
+  const btn = document.getElementById('lock-btn');
+  if (!btn) return;
+  btn.textContent = viewPinned ? '\uD83D\uDD12' : '\uD83D\uDD13';
+  btn.title = viewPinned
+    ? 'View locked \u2014 the refresh will not move the map. Click to unlock.'
+    : 'View unlocked \u2014 click to lock the map where it is.';
+  btn.classList.toggle('active', viewPinned);
+}
+
+/** Lock or release the view explicitly, independently of any gesture. */
+export function toggleViewLock() {
+  viewPinned = !viewPinned;
+  try {
+    localStorage.setItem(LOCK_KEY, viewPinned ? '1' : '0');
+    if (!viewPinned) localStorage.removeItem('sb-map-view');
+  } catch (e) {}
+  updateLockButton();
+  if (!viewPinned && markers.length > 0) {
+    const bounds = markers.map(m => m.getLatLng());
+    map.fitBounds(bounds, { padding: [30, 30], maxZoom: 13, animate: true, duration: 0.6 });
+  }
+}
+
 /** Release the pinned view so the next filter pass can refit the county. */
 export function unpinMapView() {
   viewPinned = false;
-  try { localStorage.removeItem('sb-map-view'); } catch (e) {}
+  try { localStorage.setItem(LOCK_KEY, '0'); localStorage.removeItem('sb-map-view'); } catch (e) {}
+  updateLockButton();
 }
 
 export function filterByAgency(agencyCode) {
