@@ -61,20 +61,26 @@ to contain `computeNextScrapeAt` and `countReportingAgencies`, and to contain **
 occurrences of `nextScrapeAt2` or `scrapeResults.results`. Bindings and the `*/1` cron
 survived the deploy.
 
-**The thing to check first.** Storage happens *before* the failure point, so no data was
-ever at risk, and rows kept arriving throughout the broken window. But `last_run` may
-still describe a run that began before the deploy, and the error branch pushed the cron
-lock (`meta:next_scrape_at`) fifteen minutes ahead. So:
+**Verified after deploy.** The first run on the corrected build finished at
+`2026-11-09T15:13:52.211Z`, and its record is clean:
 
-```bash
-curl -s https://watcher.ai-n.org/api/health
+```json
+{"mode": "fast", "stored": 33, "skipped": 2586, "error": null,
+ "next_scrape": "2026-11-09T15:16:52.211Z"}
 ```
 
-Healthy now looks like: no `error` field in `last_run`, `mode` present, `next_scrape`
-strictly after `timestamp`, and `reporting_agencies` in the low thirties (see below for
-why not 39). If you still see `error: nextScrapeAt2 is not a function`, that is a record
-from before the deploy — wait one cycle and look again. Do not "fix" it again; it is
-already fixed in `cbf5071`.
+Health reads `reporting_agencies: 34 of 39`, `degraded: true`. Both fixes are therefore
+confirmed in production, not merely deployed: the counter is no longer pinned at zero,
+and `next_scrape` lands three minutes *after* the run finished, so the Worker idles
+between runs instead of scraping back to back. `degraded` stays `true` because of the
+seven silent codes below, not because of a fault — which is why that denominator is the
+first open question rather than something to debug.
+
+Storage always happens before the point where the old code failed, so nothing was lost
+while pacing was broken; rows kept arriving throughout. The cron lock does mean a failed
+run can leave the Worker idle for up to fifteen minutes, so after any deploy read
+`last_run` before concluding anything — and remember it describes the last *completed*
+run, not the one in flight.
 
 ## Open questions — the owner's calls
 
