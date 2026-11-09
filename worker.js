@@ -3925,9 +3925,12 @@ function buildReportPopup(r) {
   let status;
   if (r.county_match) {
     const m = r.county_match;
+    const place = String(m.location || '').replace(/[^A-Za-z0-9]/g, '');
+    const placeHtml = place.length >= 3
+      ? ' &middot; ' + escapeReportHtml(String(m.location).trim())
+      : '';
     status = '<div class="rp-confirmed">CONFIRMED BY DISPATCH &middot; ' +
-      escapeReportHtml(String(m.call_type || '')) + ' &middot; ' +
-      escapeReportHtml(String(m.location || '')) + ' &middot; ' +
+      escapeReportHtml(String(m.call_type || '')) + placeHtml + ' &middot; ' +
       m.distance_miles + ' mi, ' + m.minutes_apart + ' min apart</div>';
   } else {
     status = '<div class="rp-tag">COMMUNITY REPORT &middot; UNVERIFIED</div>';
