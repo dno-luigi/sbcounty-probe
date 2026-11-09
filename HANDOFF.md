@@ -56,10 +56,11 @@ union, and one pinning the shadowing hazard.
 ## Deployed state
 
 The corrected build is deployed: `source: wrangler`, version
-`4e94c332-b087-4abd-89ae-3f1cba5d87c4`, from `cbf5071`. The deployed bytes were verified
-to contain `computeNextScrapeAt` and `countReportingAgencies`, and to contain **zero**
-occurrences of `nextScrapeAt2` or `scrapeResults.results`. Bindings and the `*/1` cron
-survived the deploy.
+`44713316-a797-44f2-a990-6367e4b2e6c4`, from `d9209f1`. That adds the narrowed roster,
+the slow-mode ramp, the failure retry measured from the finish, and the map-view and
+search changes. The deployed bytes were verified to contain `computeNextScrapeAt` and
+`countReportingAgencies`, and to contain **zero** occurrences of `nextScrapeAt2` or
+`scrapeResults.results`. Bindings and the `*/1` cron survived the deploy.
 
 **Verified after deploy.** The first run on the corrected build finished at
 `2026-11-09T15:13:52.211Z`, and its record is clean:
@@ -69,12 +70,12 @@ survived the deploy.
  "next_scrape": "2026-11-09T15:16:52.211Z"}
 ```
 
-Health reads `reporting_agencies: 34 of 39`, `degraded: true`. Both fixes are therefore
-confirmed in production, not merely deployed: the counter is no longer pinned at zero,
-and `next_scrape` lands three minutes *after* the run finished, so the Worker idles
-between runs instead of scraping back to back. `degraded` stays `true` because of the
-seven silent codes below, not because of a fault — which is why that denominator is the
-first open question rather than something to debug.
+Health reads `reporting_agencies: 34 of 34`, `degraded: false` — the first time that flag
+has cleared. Both fixes are therefore confirmed in production, not merely deployed: the
+counter is no longer pinned at zero, and `next_scrape` lands three minutes *after* the
+run finished, so the Worker idles between runs instead of scraping back to back. The
+flag used to stay `true` because of the five silent codes the narrowed roster removed,
+not because of a fault.
 
 Storage always happens before the point where the old code failed, so nothing was lost
 while pacing was broken; rows kept arriving throughout. The cron lock does mean a failed
