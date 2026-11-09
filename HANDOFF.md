@@ -84,12 +84,16 @@ run, not the one in flight.
 
 ## Open questions — the owner's calls
 
-1. **Seven configured agencies never report.** `ALL_AGENCY_CODES` has 39 entries; in a
-   20-minute window `AL`, `AV`, `CB`, `VT`, `RC-HE`, `RC-BE` and `RC-LE` produced no rows
-   at all, while `RC-A` … `RC-Y` and others report but are **not** in the list. So
-   `degraded` may legitimately stay `true` on a healthy pipeline, and the denominator is
-   stale in both directions. Pruning the list, or changing the threshold, changes what
-   the health number means.
+1. **`degraded` can never clear, and the roster is stale in both directions.** Health is
+   computed against 39 configured codes, and across the whole eight-day retention window
+   the best attainable count is **34**: `AL`, `CB`, `RC-HE`, `RC-BE` and `RC-LE` have no
+   rows at all, so `39 - 34 = 5 > 3` and `degraded: true` is structural rather than a
+   fault signal. In the other direction the data holds **54** agency values, because 20
+   `RC-*` station codes (`RC-T`, `RC-I`, `RC-L`, `RC-PC`, `RC-D`, …) report but are not in
+   the roster — which is why the site header advertises "54 agencies" while health says
+   39. Decide the denominator before touching the threshold: narrowing the roster and
+   widening it are different decisions, and neither is the same as measuring against the
+   codes that have reported recently.
 2. **Slow mode never varies.** It computes `Math.min(prevInterval * 2, 15 min)` then
    `Math.max(that, 15 min)`, which is always exactly 15 minutes, so the intended backoff
    is dead code.
@@ -97,6 +101,10 @@ run, not the one in flight.
    the scraper's implementation is readable by anyone, including the agencies it reads.
 4. **Rotate `GITHUB_PAT_TOKEN`.** It was printed into a chat transcript by a malformed
    inline git credential helper on 2026-11-09, and it still authenticated afterwards.
+5. **The error path still measures its retry from the run's start.** The `catch` that
+   schedules after a failure computes `now + 15 min` from when the run *began*, not when
+   it failed. Harmless at ~190 s, so it was left alone in `cbf5071`; it becomes a
+   same-minute retry loop if a failing run ever exceeds fifteen minutes.
 
 ## Working rules that will bite you
 
