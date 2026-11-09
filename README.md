@@ -69,6 +69,14 @@ from `aspNet`, and is exported so the rule is testable:
 node --test test/     # 6 tests, covering the bug directly
 ```
 
+### The second fix: cadence
+
+Fast mode is a 3-minute interval, but a run takes about 185 seconds. `next_scrape` was
+computed from the moment the cron fired, so it was written **in the past** on every
+fast run — observed as `next_scrape: 14:32:38` against a `timestamp` of `14:32:44` —
+and each minute's tick started a fresh scrape with no idle gap. Scheduling from the
+finish time (`nextScrapeAt()`) restores the intended pause.
+
 ## Working here
 
 ```bash

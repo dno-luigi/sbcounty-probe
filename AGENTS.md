@@ -17,6 +17,9 @@ from one origin.
   nothing and the data is neither stale nor changed. Do not shorten the interval to
   chase freshness — the source sites rate-limit and `meta:rate_limited` already
   suspends scraping for 5 minutes when they do.
+- **The next run is scheduled from when this one finished.** A run takes ~185 s;
+  scheduling from the start time wrote `next_scrape` into the past, so fast mode began
+  the next scrape the moment the previous one returned. Use `nextScrapeAt()`.
 - **Deduplication is the content hash.** `INSERT OR IGNORE INTO dispatch_calls` keyed
   on `hash`, produced by `contentHash(normalized)`. A run with `stored: 0` is normal,
   not a fault: it means nothing new. Never "fix" emptiness by dropping the hash.

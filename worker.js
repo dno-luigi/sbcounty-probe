@@ -1188,6 +1188,19 @@ function countReportingAgencies(scrapeResults) {
   return Object.keys(buckets).filter((code) => (buckets[code] || []).length > 0).length;
 }
 __name(countReportingAgencies, "countReportingAgencies");
+
+/**
+ * When the next run should start, measured from when this one finished.
+ *
+ * Scheduling from the start time (now + interval) meant that a run lasting longer
+ * than its interval — 185s against a 180s fast-mode interval — wrote `next_scrape`
+ * in the past, so the very next minute's tick started a fresh scrape with no idle
+ * gap. Measure from the finish instead.
+ */
+function nextScrapeAt(finishedAt, intervalMs) {
+  return finishedAt + intervalMs;
+}
+__name(nextScrapeAt, "nextScrapeAt");
 async function handleHealth(env) {
   const health = await env.DISPATCH_KV.get('meta:source_health', 'json');
   const lastRun = await env.DISPATCH_KV.get('meta:last_run', 'json');
@@ -4683,7 +4696,7 @@ var index_default = {
             mode = "slow";
           }
         }
-        const nextAt = now + intervalMs;
+        const nextAt = nextScrapeAt(Date.now(), intervalMs);
         const result = {
           timestamp: (/* @__PURE__ */ new Date()).toISOString(),
           mode,
@@ -4723,7 +4736,8 @@ var index_default = {
 };
 export {
   index_default as default,
-  countReportingAgencies
+  countReportingAgencies,
+  nextScrapeAt
 };
 //# sourceMappingURL=worker.js.map
 
