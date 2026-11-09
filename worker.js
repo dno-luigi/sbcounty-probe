@@ -1412,6 +1412,7 @@ async function handleApi(request, env, ctx) {
   if (path === "/api/analytics/response-times") return handleResponseTimes(env);
   if (path === "/api/analytics/zip-density") return handleZipDensity(env);
   if (path === "/api/analytics/route-alerts" && request.method === "POST") return handleRouteAlerts(request, env);
+  if (path.startsWith("/api/reports/") && request.method === "POST") return handleReportAction(request, env, path);
   if (path === "/api/reports" && request.method === "GET") return handleListReports(env);
   if (path === "/api/reports" && request.method === "POST") return handleCreateReport(request, env);
   if (path === "/api/codes") return handleCodes();
@@ -1572,16 +1573,183 @@ async function reportClientKey(request) {
   return Array.from(new Uint8Array(digest)).slice(0, 12).map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+var REPORT_MATCH_MILES = 0.6;
+var REPORT_MATCH_WINDOW_MS = 30 * 60 * 1e3;
+var REPORT_ABUSE_HIDE_AT = 3;
+
+function toRadians(deg) {
+  return deg * Math.PI / 180;
+}
+
+/** Great-circle distance in miles between two points. */
+function distanceMiles(aLat, aLng, bLat, bLng) {
+  const R = 3958.7613;
+  const dLat = toRadians(bLat - aLat);
+  const dLng = toRadians(bLng - aLng);
+  const h = Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRadians(aLat)) * Math.cos(toRadians(bLat)) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.min(1, Math.sqrt(h)));
+}
+
+/** How far Pacific time is from UTC at a given instant, in ms (negative in PST/PDT). */
+function pacificOffsetMs(utcMs) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/Los_Angeles",
+    hour12: false,
+    year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", second: "2-digit"
+  }).formatToParts(new Date(utcMs));
+  const get = (type) => parseInt(parts.find((p) => p.type === type).value, 10);
+  const asUtc = Date.UTC(get("year"), get("month") - 1, get("day"), get("hour") % 24, get("minute"), get("second"));
+  return asUtc - utcMs;
+}
+
+/**
+ * The county feeds publish local wall-clock text like "11/1/2026 8:35:37 PM".
+ * Returns epoch ms, or null when the string is not in that shape.
+ */
+function parseDispatchTime(value) {
+  if (typeof value !== "string") return null;
+  const m = /^(\d{1,2})\/(\d{1,2})\/(\d{4})\s+(\d{1,2}):(\d{2})(?::(\d{2}))?\s*([AP]M)?$/i.exec(value.trim());
+  if (!m) return null;
+  const month = parseInt(m[1], 10);
+  const day = parseInt(m[2], 10);
+  const year = parseInt(m[3], 10);
+  let hour = parseInt(m[4], 10);
+  const minute = parseInt(m[5], 10);
+  const second = m[6] ? parseInt(m[6], 10) : 0;
+  const ampm = m[7] ? m[7].toUpperCase() : "";
+  if (ampm === "PM" && hour < 12) hour += 12;
+  if (ampm === "AM" && hour === 12) hour = 0;
+  if (month < 1 || month > 12 || day < 1 || day > 31 || hour > 23 || minute > 59 || second > 59) return null;
+  const guess = Date.UTC(year, month - 1, day, hour, minute, second);
+  return guess - pacificOffsetMs(guess);
+}
+
+/** The closest scraped call near the report in both space and time, if any. */
+function findCountyMatch(report, candidates) {
+  const reportTime = Number(report && report.created_at);
+  const lat = Number(report && report.lat);
+  const lng = Number(report && report.lng);
+  if (!Number.isFinite(reportTime) || !Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+  let best = null;
+  for (const c of candidates || []) {
+    if (!Number.isFinite(c.lat) || !Number.isFinite(c.lng) || c.ts == null) continue;
+    const gap = Math.abs(c.ts - reportTime);
+    if (gap > REPORT_MATCH_WINDOW_MS) continue;
+    const miles = distanceMiles(lat, lng, c.lat, c.lng);
+    if (miles > REPORT_MATCH_MILES) continue;
+    if (!best || miles < best.distance_miles) {
+      best = {
+        hash: c.hash,
+        agency: c.agency,
+        call_type: c.call_type,
+        location: c.location || "",
+        call_date: c.call_date,
+        distance_miles: Math.round(miles * 100) / 100,
+        minutes_apart: Math.round(gap / 60000)
+      };
+    }
+  }
+  return best;
+}
+
+/** Recent geocoded calls, newest first, with their dispatch time pre-parsed. */
+async function loadCountyCandidates(env) {
+  const res = await env.DISPATCH_D1.prepare(
+    "SELECT hash, agency, call_type, call_date, location_clean, lat, lng FROM dispatch_calls WHERE lat IS NOT NULL AND lng IS NOT NULL ORDER BY rowid DESC LIMIT 3000"
+  ).all();
+  return (res.results || []).map((r) => ({
+    hash: r.hash,
+    agency: r.agency,
+    call_type: r.call_type,
+    call_date: r.call_date,
+    location: r.location_clean || "",
+    lat: Number(r.lat),
+    lng: Number(r.lng),
+    ts: parseDispatchTime(r.call_date)
+  })).filter((c) => c.ts != null);
+}
+
+/** Reports the crowd flagged enough times to be hidden. */
+async function loadHiddenReportIds(env) {
+  try {
+    const listed = await env.DISPATCH_KV.list({ prefix: "report_hidden:" });
+    return new Set((listed.keys || []).map((k) => k.name.slice("report_hidden:".length)));
+  } catch (err) {
+    return new Set();
+  }
+}
+
 async function handleListReports(env) {
   const now = Date.now();
   const rows = await env.DISPATCH_D1.prepare(
     "SELECT id, created_at, category, note, lat, lng, confirmations FROM user_reports WHERE expires_at > ? ORDER BY created_at DESC LIMIT 200"
   ).bind(now).all();
+  const hidden = await loadHiddenReportIds(env);
+  const active = (rows.results || []).filter((r) => !hidden.has(r.id));
+  let candidates = [];
+  if (active.length) {
+    try {
+      candidates = await loadCountyCandidates(env);
+    } catch (err) {
+      console.error("County match lookup failed:", err.message);
+    }
+  }
+  const reports = active.map((r) => {
+    const match = findCountyMatch(r, candidates);
+    return match ? Object.assign({}, r, { county_match: match }) : r;
+  });
   return json({
-    reports: rows.results || [],
+    reports,
     unverified: true,
     ttl_hours: REPORT_TTL_MS / 36e5
   });
+}
+
+async function handleReportAction(request, env, path) {
+  const m = /^\/api\/reports\/([A-Za-z0-9-]{8,64})\/(abuse|confirm)$/.exec(path);
+  if (!m) return json({ error: "Not found" }, 404);
+  const id = m[1];
+  const action = m[2];
+  const exists = await env.DISPATCH_D1.prepare(
+    "SELECT id, confirmations FROM user_reports WHERE id = ? AND expires_at > ?"
+  ).bind(id, Date.now()).first();
+  if (!exists) return json({ error: "Report not found" }, 404);
+  const caller = await reportClientKey(request);
+  if (!caller) return json({ error: "Cannot identify caller" }, 400);
+
+  if (action === "confirm") {
+    const rlKey = "report_confirm_rl:" + id + ":" + caller;
+    if (await env.DISPATCH_KV.get(rlKey)) {
+      return json({ error: "You already confirmed this report" }, 429);
+    }
+    await env.DISPATCH_KV.put(rlKey, "1", { expirationTtl: 86400 });
+    await env.DISPATCH_D1.prepare(
+      "UPDATE user_reports SET confirmations = confirmations + 1 WHERE id = ?"
+    ).bind(id).run();
+    const after = await env.DISPATCH_D1.prepare(
+      "SELECT confirmations FROM user_reports WHERE id = ?"
+    ).bind(id).first();
+    const count = after && Number.isFinite(Number(after.confirmations))
+      ? Number(after.confirmations)
+      : Number(exists.confirmations || 0) + 1;
+    return json({ ok: true, confirmations: count });
+  }
+
+  const rlKey = "report_abuse_rl:" + id + ":" + caller;
+  if (await env.DISPATCH_KV.get(rlKey)) {
+    return json({ error: "You already flagged this report" }, 429);
+  }
+  await env.DISPATCH_KV.put(rlKey, "1", { expirationTtl: 3600 });
+  const current = Number(await env.DISPATCH_KV.get("report_abuse:" + id)) || 0;
+  const next = current + 1;
+  await env.DISPATCH_KV.put("report_abuse:" + id, String(next), { expirationTtl: 12 * 60 * 60 });
+  const hidden = next >= REPORT_ABUSE_HIDE_AT;
+  if (hidden) {
+    await env.DISPATCH_KV.put("report_hidden:" + id, "1", { expirationTtl: 12 * 60 * 60 });
+  }
+  return json({ ok: true, flags: next, hidden });
 }
 
 async function handleCreateReport(request, env) {
@@ -2168,6 +2336,11 @@ header {
 .report-pick-hint.hidden { display: none; }
 .report-pin { background: transparent; border: none; }
 .report-pin span { display: block; width: 14px; height: 14px; border-radius: 50%; background: #f59e0b; border: 2px solid #fff; box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.35); }
+.rp-confirmed { font-family: var(--mono); font-size: 9px; letter-spacing: 0.04em; color: #22c55e; font-weight: 600; }
+.rp-count { font-size: 11px; color: var(--text-2); margin-top: 4px; }
+.rp-actions { display: flex; gap: 0.4rem; margin-top: 6px; }
+.rp-actions button { background: var(--bg-raised); border: 1px solid var(--border); color: var(--text-2); border-radius: 3px; font-family: var(--mono); font-size: 10px; padding: 0.2rem 0.4rem; cursor: pointer; }
+.rp-actions button:hover { color: var(--text); border-color: var(--text-3); }
 
 .filter-scroll {
   display: flex;
@@ -3724,27 +3897,63 @@ export function initReportLayer() {
   if (!reportGroup) reportGroup = L.layerGroup().addTo(map);
 }
 
+function reportIdArg(r) {
+  return String(r.id == null ? '' : r.id).replace(/[^A-Za-z0-9-]/g, '');
+}
+
 function buildReportPopup(r) {
   const when = timeAgo(new Date(r.created_at).toISOString());
   const note = r.note ? '<div class="rp-note">' + escapeReportHtml(r.note) + '</div>' : '';
-  return '<div class="report-popup">' +
-    '<div class="rp-tag">COMMUNITY REPORT &middot; UNVERIFIED</div>' +
+  let status;
+  if (r.county_match) {
+    const m = r.county_match;
+    status = '<div class="rp-confirmed">CONFIRMED BY DISPATCH &middot; ' +
+      escapeReportHtml(String(m.call_type || '')) + ' &middot; ' +
+      escapeReportHtml(String(m.location || '')) + ' &middot; ' +
+      m.distance_miles + ' mi, ' + m.minutes_apart + ' min apart</div>';
+  } else {
+    status = '<div class="rp-tag">COMMUNITY REPORT &middot; UNVERIFIED</div>';
+  }
+  const confirms = Number(r.confirmations) || 0;
+  const counts = confirms
+    ? '<div class="rp-count">' + confirms + (confirms === 1 ? ' neighbour confirmed this' : ' neighbours confirmed this') + '</div>'
+    : '';
+  const id = reportIdArg(r);
+  return '<div class="report-popup">' + status +
     '<div class="rp-cat">' + escapeReportHtml(r.category) + ' &middot; ' + when + '</div>' +
-    note + '</div>';
+    note + counts +
+    '<div class="rp-actions">' +
+    '<button type="button" data-id="' + id + '" onclick="window.confirmReport(this.dataset.id)">Confirm</button>' +
+    '<button type="button" data-id="' + id + '" onclick="window.reportAbuse(this.dataset.id)">Report abuse</button>' +
+    '<button type="button" data-id="' + id + '" onclick="window.hideReportLocally(this.dataset.id)">Hide for me</button>' +
+    '</div></div>';
+}
+
+const HIDDEN_REPORTS_KEY = 'sb-hidden-reports';
+
+function locallyHiddenReports() {
+  try {
+    return new Set(JSON.parse(localStorage.getItem(HIDDEN_REPORTS_KEY) || '[]'));
+  } catch (e) {
+    return new Set();
+  }
 }
 
 export function renderReports(reports) {
   if (!reportGroup) reportGroup = L.layerGroup().addTo(map);
   reportGroup.clearLayers();
+  const hidden = locallyHiddenReports();
   for (const r of reports || []) {
     if (!Number.isFinite(r.lat) || !Number.isFinite(r.lng)) continue;
+    if (hidden.has(r.id)) continue;
+    const colour = r.county_match ? '#22c55e' : '#f59e0b';
     const m = L.circleMarker([r.lat, r.lng], {
-      radius: 8,
-      color: '#f59e0b',
+      radius: r.county_match ? 9 : 8,
+      color: colour,
       weight: 2,
-      dashArray: '3 3',
-      fillColor: '#f59e0b',
-      fillOpacity: 0.3,
+      dashArray: r.county_match ? null : '3 3',
+      fillColor: colour,
+      fillOpacity: r.county_match ? 0.45 : 0.3,
       opacity: 0.95,
     }).addTo(reportGroup);
     m.bindPopup(buildReportPopup(r));
@@ -4743,6 +4952,44 @@ window.submitReport = async function () {
   }
 };
 
+async function reportAction(id, action) {
+  var resp = await fetch('/api/reports/' + encodeURIComponent(id) + '/' + action, { method: 'POST' });
+  var data = await resp.json().catch(function () { return {}; });
+  return { ok: resp.ok, status: resp.status, data: data };
+}
+
+window.confirmReport = async function (id) {
+  var res = await reportAction(id, 'confirm');
+  if (!res.ok) {
+    alert(res.data.error || 'Could not confirm this report');
+  }
+  await loadReports();
+};
+
+window.reportAbuse = async function (id) {
+  if (!window.confirm('Flag this report as false or abusive? Enough flags and it is hidden for everyone.')) return;
+  var res = await reportAction(id, 'abuse');
+  if (!res.ok) {
+    alert(res.data.error || 'Could not flag this report');
+  } else if (res.data && res.data.hidden) {
+    alert('Thanks - this report is now hidden for everyone.');
+  }
+  await loadReports();
+};
+
+window.hideReportLocally = function (id) {
+  var key = 'sb-hidden-reports';
+  var list;
+  try {
+    list = JSON.parse(localStorage.getItem(key) || '[]');
+  } catch (e) {
+    list = [];
+  }
+  if (list.indexOf(id) === -1) list.push(id);
+  localStorage.setItem(key, JSON.stringify(list.slice(-200)));
+  loadReports();
+};
+
 async function fetchLatest(limit = 500) {
   const resp = await fetch(\`/api/dispatch/latest?limit=\${limit}\`);
   if (!resp.ok) throw new Error(\`API error: \${resp.status}\`);
@@ -5288,7 +5535,10 @@ export {
   computeSlowInterval,
   isReportCategory,
   isReportInBBox,
-  cleanReportNote
+  cleanReportNote,
+  distanceMiles,
+  parseDispatchTime,
+  findCountyMatch
 };
 //# sourceMappingURL=worker.js.map
 
