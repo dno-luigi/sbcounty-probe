@@ -1175,6 +1175,19 @@ function json(data, status = 200, extraHeaders = {}) {
   });
 }
 __name(json, "json");
+/**
+ * How many agencies actually reported this cycle.
+ *
+ * runScraper() returns { aspNet, wordpress, riverside, stats, errors } — there is no
+ * `results` property. Reading one made every health record claim 0 of 39 agencies
+ * reporting, and `degraded` is computed as (total - reporting) > 3, so it was pinned
+ * to true no matter what the pipeline did. An agency counts when it returned rows.
+ */
+function countReportingAgencies(scrapeResults) {
+  const buckets = scrapeResults?.aspNet || {};
+  return Object.keys(buckets).filter((code) => (buckets[code] || []).length > 0).length;
+}
+__name(countReportingAgencies, "countReportingAgencies");
 async function handleHealth(env) {
   const health = await env.DISPATCH_KV.get('meta:source_health', 'json');
   const lastRun = await env.DISPATCH_KV.get('meta:last_run', 'json');
@@ -4635,7 +4648,7 @@ var index_default = {
         const storageResults = await processScrapeResults(env, scrapeResults);
         const purgeResults = await purgeOldRecords(env, 8);
         const agencyErrors = scrapeResults.errors || [];
-        const reportingAgencies = Object.keys(scrapeResults.results || {}).length;
+        const reportingAgencies = countReportingAgencies(scrapeResults);
         const totalAgencies = (ALL_AGENCY_CODES || []).length;
         await env.DISPATCH_KV.put('meta:source_health', JSON.stringify({ timestamp: now, reporting: reportingAgencies, total: totalAgencies, errors: agencyErrors.length, errorDetails: agencyErrors.slice(0, 10) }));
         const lastBackup = await env.DISPATCH_KV.get('meta:last_backup', 'json');
@@ -4709,7 +4722,8 @@ var index_default = {
   }
 };
 export {
-  index_default as default
+  index_default as default,
+  countReportingAgencies
 };
 //# sourceMappingURL=worker.js.map
 

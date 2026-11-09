@@ -1,0 +1,26 @@
+// Reproduces the deployed Worker's bindings exactly, so a deploy from this
+// repository changes code and nothing else. The ids are identifiers, not
+// credentials; the Worker holds no secrets of its own.
+{
+  "name": "sbcounty-probe",
+  "main": "worker.js",
+  "compatibility_date": "2026-08-20",
+
+  // Dispatch records, deduplicated by content hash, purged after 8 days.
+  "d1_databases": [
+    { "binding": "DISPATCH_D1", "database_name": "sbcd1", "database_id": "eb19d2f8-8555-4aea-a3dc-6b6e6c37ba1e" }
+  ],
+
+  // Run metadata: last_run, source_health, rate limiting, per-agency latest.
+  "kv_namespaces": [
+    { "binding": "DISPATCH_KV", "id": "35069c0e518a4a68b952a208e0cc225c" }
+  ],
+
+  // Snapshots, daily backups and the scrape log.
+  "r2_buckets": [
+    { "binding": "DISPATCH_R2", "bucket_name": "sbclog" }
+  ],
+
+  // Every minute; scheduled() decides whether to scrape fast or slow.
+  "triggers": { "crons": ["*/1 * * * *"] }
+}
