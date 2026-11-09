@@ -2341,6 +2341,15 @@ header {
 .rp-actions { display: flex; gap: 0.4rem; margin-top: 6px; }
 .rp-actions button { background: var(--bg-raised); border: 1px solid var(--border); color: var(--text-2); border-radius: 3px; font-family: var(--mono); font-size: 10px; padding: 0.2rem 0.4rem; cursor: pointer; }
 .rp-actions button:hover { color: var(--text); border-color: var(--text-3); }
+.report-legend { background: var(--bg-raised); border: 1px solid var(--border); border-radius: 6px; padding: 0.45rem 0.55rem; font-family: var(--mono); font-size: 10px; color: var(--text-2); box-shadow: 0 2px 10px rgba(0, 0, 0, 0.35); }
+.report-legend .rl-title { color: var(--text); font-size: 9px; margin-bottom: 0.25rem; letter-spacing: 0.05em; text-transform: uppercase; }
+.report-legend .rl-row { display: flex; align-items: center; gap: 0.35rem; margin-bottom: 0.15rem; }
+.report-legend .rl-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+.report-legend .rl-dot.amber { background: #f59e0b; }
+.report-legend .rl-dot.green { background: #22c55e; }
+.report-legend .rl-buttons { display: flex; gap: 0.25rem; margin-top: 0.35rem; }
+.report-legend .rl-buttons button { background: var(--bg); border: 1px solid var(--border); color: var(--text-2); border-radius: 3px; font-family: var(--mono); font-size: 9px; padding: 0.15rem 0.32rem; cursor: pointer; }
+.report-legend .rl-buttons button.active { color: var(--text); border-color: #f59e0b; }
 
 .filter-scroll {
   display: flex;
@@ -3391,6 +3400,15 @@ let userWatchId = null;
 let viewPinned = false;
 const LOCK_KEY = 'sb-map-lock';
 let reportGroup = null;
+let lastReports = [];
+let reportLegendControl = null;
+let reportFilter = 'all';
+try {
+  const savedFilter = localStorage.getItem('sb-report-filter');
+  if (savedFilter === 'confirmed' || savedFilter === 'off') reportFilter = savedFilter;
+} catch (e) {
+  reportFilter = 'all';
+}
 
 const DEFAULT_CENTER = [34.85, -117.2];
 const DEFAULT_ZOOM = 10;
@@ -3940,12 +3958,15 @@ function locallyHiddenReports() {
 }
 
 export function renderReports(reports) {
+  lastReports = reports || [];
   if (!reportGroup) reportGroup = L.layerGroup().addTo(map);
   reportGroup.clearLayers();
   const hidden = locallyHiddenReports();
-  for (const r of reports || []) {
+  for (const r of lastReports) {
     if (!Number.isFinite(r.lat) || !Number.isFinite(r.lng)) continue;
     if (hidden.has(r.id)) continue;
+    if (reportFilter === 'off') continue;
+    if (reportFilter === 'confirmed' && !r.county_match) continue;
     const colour = r.county_match ? '#22c55e' : '#f59e0b';
     const m = L.circleMarker([r.lat, r.lng], {
       radius: r.county_match ? 9 : 8,
@@ -4013,6 +4034,54 @@ export function stopReportPick() {
     const el = map.getContainer();
     if (el) el.style.cursor = '';
   }
+}
+
+function updateLegendState() {
+  const buttons = document.querySelectorAll('.report-legend .rl-buttons button');
+  for (let i = 0; i < buttons.length; i++) {
+    const btn = buttons[i];
+    if (btn.getAttribute('data-mode') === reportFilter) btn.classList.add('active');
+    else btn.classList.remove('active');
+  }
+}
+
+export function setReportFilter(mode) {
+  reportFilter = (mode === 'confirmed' || mode === 'off') ? mode : 'all';
+  try {
+    localStorage.setItem('sb-report-filter', reportFilter);
+  } catch (e) {
+    /* storage may be blocked */
+  }
+  updateLegendState();
+  renderReports(lastReports);
+}
+
+/** Legend plus an all / confirmed / off filter for the crowd layer. */
+export function initReportLegend() {
+  if (!map || reportLegendControl) return;
+  reportLegendControl = L.control({ position: 'bottomright' });
+  reportLegendControl.onAdd = function () {
+    const div = L.DomUtil.create('div', 'report-legend');
+    div.innerHTML =
+      '<div class="rl-title">Community reports</div>' +
+      '<div class="rl-row"><span class="rl-dot amber"></span>Unverified</div>' +
+      '<div class="rl-row"><span class="rl-dot green"></span>Confirmed by dispatch</div>' +
+      '<div class="rl-buttons">' +
+      '<button type="button" data-mode="all">All</button>' +
+      '<button type="button" data-mode="confirmed">Confirmed</button>' +
+      '<button type="button" data-mode="off">Off</button>' +
+      '</div>';
+    L.DomEvent.disableClickPropagation(div);
+    const btns = div.querySelectorAll('button');
+    for (let i = 0; i < btns.length; i++) {
+      btns[i].addEventListener('click', function () {
+        setReportFilter(this.getAttribute('data-mode'));
+      });
+    }
+    return div;
+  };
+  reportLegendControl.addTo(map);
+  updateLegendState();
 }
 
 /** Reflect the lock state on the map control. */
@@ -4792,7 +4861,7 @@ export function showDeepDive(record) {
 
 window.showDeepDive = showDeepDive;
 `, type: "application/javascript" },
-  "/js/app.js": { content: `import { initMap, updateMap, filterByAgency, filterByExclude, filterNearby, setMapUserLocation, removeMapUserLocation, applySearchFilter, unpinMapView, initReportLayer, renderReports, currentMapCenter, setReportPreview, clearReportPreview, startReportPick, stopReportPick } from './map.js';
+  "/js/app.js": { content: `import { initMap, updateMap, filterByAgency, filterByExclude, filterNearby, setMapUserLocation, removeMapUserLocation, applySearchFilter, unpinMapView, initReportLayer, initReportLegend, renderReports, currentMapCenter, setReportPreview, clearReportPreview, startReportPick, stopReportPick } from './map.js';
 import { updateCards, filterCards, highlightCard, setSort, setGroup, setCategory, setBookmarkMode, renderSkeletons } from './cards.js';
 window.toggleBookmarkMode = function() { var btn = document.getElementById('btn-bookmarks'); var active = btn.classList.toggle('active'); setBookmarkMode(active); btn.textContent = active ? '\u2605' : '\u2606'; };
 import { showDeepDive } from './deepdive.js';
@@ -5325,6 +5394,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
   initMap();
   initReportLayer();
+  initReportLegend();
 
   document.getElementById('search').addEventListener('input', (e) => {
     currentSearch = e.target.value;
