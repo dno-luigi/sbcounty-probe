@@ -1943,6 +1943,8 @@ header {
   padding: 0.6rem 1rem;
   background: var(--bg-card);
   border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
   height: 48px;
   z-index: 100;
   flex-shrink: 0;
@@ -3056,6 +3058,7 @@ let locateControl = null;
 let userMarker = null;
 let userPulse = null;
 let userWatchId = null;
+let viewPinned = false;
 
 const DEFAULT_CENTER = [34.85, -117.2];
 const DEFAULT_ZOOM = 10;
@@ -3321,10 +3324,19 @@ function pulseMarker(marker) {
 }
 
 export function initMap() {
+  let savedView = null;
+  try { savedView = JSON.parse(localStorage.getItem('sb-map-view') || 'null'); } catch (e) { savedView = null; }
+  if (!savedView || !Number.isFinite(savedView.lat) || !Number.isFinite(savedView.lng) || !Number.isFinite(savedView.zoom)) {
+    savedView = null;
+  }
+  viewPinned = !!savedView;
   map = L.map('map', {
     zoomControl: true,
     attributionControl: false,
-  }).setView(DEFAULT_CENTER, DEFAULT_ZOOM);
+  }).setView(
+    savedView ? [savedView.lat, savedView.lng] : DEFAULT_CENTER,
+    savedView ? savedView.zoom : DEFAULT_ZOOM
+  );
 
   L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
     maxZoom: 19,
@@ -3332,6 +3344,20 @@ export function initMap() {
   }).addTo(map);
 
   markerGroup = L.layerGroup().addTo(map);
+
+  // Once the user pans, zooms or picks a record, that view is theirs: the refresh
+  // used to fit the whole county every sixty seconds and yank them out of it.
+  const pinView = () => { viewPinned = true; };
+  map.getContainer().addEventListener('mousedown', pinView);
+  map.getContainer().addEventListener('touchstart', pinView, { passive: true });
+  map.getContainer().addEventListener('wheel', pinView, { passive: true });
+  map.on('moveend', () => {
+    if (!viewPinned) return;
+    const c = map.getCenter();
+    try {
+      localStorage.setItem('sb-map-view', JSON.stringify({ lat: c.lat, lng: c.lng, zoom: map.getZoom() }));
+    } catch (e) {}
+  });
 
   legendControl = L.control({ position: 'bottomright' });
   legendControl.onAdd = function () {
@@ -3395,7 +3421,7 @@ export function updateMap(records) {
     }
   }
 
-  if (bounds.length > 0) {
+  if (bounds.length > 0 && !viewPinned) {
     map.fitBounds(bounds, { padding: [30, 30], maxZoom: 13, animate: true, duration: 0.8 });
   }
 
@@ -3476,6 +3502,35 @@ export function pulseMarkerByHash(hash) {
   if (m) pulseMarker(m);
 }
 
+function searchHit(r, q) {
+  if (!r) return false;
+  const fields = [r.location, r.call_type, r.call_no, r.dispo, r.agency];
+  for (const f of fields) {
+    if (f && String(f).toLowerCase().indexOf(q) !== -1) return true;
+  }
+  return false;
+}
+
+/** Hide markers that do not match the same five fields the card list searches. */
+export function applySearchFilter(term) {
+  const q = (term || '').trim().toLowerCase();
+  for (const m of markers) {
+    const r = findRecordByHash(m._recordHash);
+    const visible = !q || searchHit(r, q);
+    if (visible) {
+      if (!markerGroup.hasLayer(m)) markerGroup.addLayer(m);
+    } else if (markerGroup.hasLayer(m)) {
+      markerGroup.removeLayer(m);
+    }
+  }
+}
+
+/** Release the pinned view so the next filter pass can refit the county. */
+export function unpinMapView() {
+  viewPinned = false;
+  try { localStorage.removeItem('sb-map-view'); } catch (e) {}
+}
+
 export function filterByAgency(agencyCode) {
   markerGroup.clearLayers();
   markers = [];
@@ -3489,7 +3544,7 @@ export function filterByAgency(agencyCode) {
       }
     }
   }
-  if (markers.length > 0) {
+  if (markers.length > 0 && !viewPinned) {
     const bounds = markers.map(m => m.getLatLng());
     map.fitBounds(bounds, { padding: [30, 30], maxZoom: 14, animate: true, duration: 0.6 });
   }
@@ -3508,7 +3563,7 @@ export function filterByExclude(excludedSet) {
       }
     }
   }
-  if (markers.length > 0) {
+  if (markers.length > 0 && !viewPinned) {
     const bounds = markers.map(m => m.getLatLng());
     map.fitBounds(bounds, { padding: [30, 30], maxZoom: 14, animate: true, duration: 0.6 });
   }
@@ -4221,7 +4276,7 @@ export function showDeepDive(record) {
 
 window.showDeepDive = showDeepDive;
 `, type: "application/javascript" },
-  "/js/app.js": { content: `import { initMap, updateMap, filterByAgency, filterByExclude, filterNearby, setMapUserLocation, removeMapUserLocation } from './map.js';
+  "/js/app.js": { content: `import { initMap, updateMap, filterByAgency, filterByExclude, filterNearby, setMapUserLocation, removeMapUserLocation, applySearchFilter, unpinMapView } from './map.js';
 import { updateCards, filterCards, highlightCard, setSort, setGroup, setCategory, setBookmarkMode, renderSkeletons } from './cards.js';
 window.toggleBookmarkMode = function() { var btn = document.getElementById('btn-bookmarks'); var active = btn.classList.toggle('active'); setBookmarkMode(active); btn.textContent = active ? '\u2605' : '\u2606'; };
 import { showDeepDive } from './deepdive.js';
@@ -4309,6 +4364,7 @@ function renderAgencyFilters(agencies) {
 }
 
 function selectAgency(code) {
+  if (!code) unpinMapView();
   currentAgency = code || null;
   window._currentAgency = currentAgency || '';
   document.querySelectorAll('.agency-btn').forEach(btn => {
@@ -4369,6 +4425,7 @@ function applyFilters() {
   } else {
     filterByExclude(excludedAgencies);
   }
+  applySearchFilter(currentSearch);
   syncUrlParams();
 }
 
