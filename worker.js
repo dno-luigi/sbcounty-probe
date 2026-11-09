@@ -1183,9 +1183,24 @@ __name(json, "json");
  * reporting, and `degraded` is computed as (total - reporting) > 3, so it was pinned
  * to true no matter what the pipeline did. An agency counts when it returned rows.
  */
-function countReportingAgencies(scrapeResults) {
+function countReportingAgencies(scrapeResults, configured = ALL_AGENCY_CODES) {
+  const allowed = new Set(configured || []);
+  const reported = /* @__PURE__ */ new Set();
   const buckets = scrapeResults?.aspNet || {};
-  return Object.keys(buckets).filter((code) => (buckets[code] || []).length > 0).length;
+  for (const [code, rows] of Object.entries(buckets)) {
+    if ((rows || []).length > 0) reported.add(code);
+  }
+  for (const row of scrapeResults?.riverside || []) {
+    if (row && row.agency) reported.add(row.agency);
+  }
+  for (const row of scrapeResults?.wordpress || []) {
+    if (row && row.agency) reported.add(row.agency);
+  }
+  let count = 0;
+  for (const code of reported) {
+    if (allowed.has(code)) count++;
+  }
+  return count;
 }
 __name(countReportingAgencies, "countReportingAgencies");
 
@@ -1196,11 +1211,15 @@ __name(countReportingAgencies, "countReportingAgencies");
  * than its interval — 185s against a 180s fast-mode interval — wrote `next_scrape`
  * in the past, so the very next minute's tick started a fresh scrape with no idle
  * gap. Measure from the finish instead.
+ *
+ * Deliberately not called nextScrapeAt: scheduled() already binds a local
+ * `nextScrapeAt` (the KV lock deadline), so a module-level function of that name
+ * is shadowed there and the call resolves to a number.
  */
-function nextScrapeAt(finishedAt, intervalMs) {
+function computeNextScrapeAt(finishedAt, intervalMs) {
   return finishedAt + intervalMs;
 }
-__name(nextScrapeAt, "nextScrapeAt");
+__name(computeNextScrapeAt, "computeNextScrapeAt");
 async function handleHealth(env) {
   const health = await env.DISPATCH_KV.get('meta:source_health', 'json');
   const lastRun = await env.DISPATCH_KV.get('meta:last_run', 'json');
@@ -4696,7 +4715,7 @@ var index_default = {
             mode = "slow";
           }
         }
-        const nextAt = nextScrapeAt(Date.now(), intervalMs);
+        const nextAt = computeNextScrapeAt(Date.now(), intervalMs);
         const result = {
           timestamp: (/* @__PURE__ */ new Date()).toISOString(),
           mode,
@@ -4737,7 +4756,7 @@ var index_default = {
 export {
   index_default as default,
   countReportingAgencies,
-  nextScrapeAt
+  computeNextScrapeAt
 };
 //# sourceMappingURL=worker.js.map
 
