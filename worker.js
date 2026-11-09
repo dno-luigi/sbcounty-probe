@@ -1924,6 +1924,10 @@ var STATIC_ASSETS = {
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
 </head>
 <body>
+  <div id="report-pick-hint" class="report-pick-hint hidden">
+    <span>Tap the map to place your pin</span>
+    <button class="btn btn-ghost" onclick="window.cancelReportPick()">Cancel</button>
+  </div>
   <div id="stale-banner" class="stale-banner hidden">Data may be stale — source site may be down</div>
   <header>
     <div class="header-left">
@@ -1992,8 +1996,12 @@ var STATIC_ASSETS = {
       <div class="report-row">
         <input id="report-note" type="text" maxlength="280" placeholder="What are you seeing? (optional)">
       </div>
+      <p class="report-fine">Approximate is fine - a cross street or landmark helps.</p>
       <div class="report-row report-loc">
         <span id="report-loc-label">Using the map centre</span>
+      </div>
+      <div class="report-row report-actions">
+        <button id="report-pick" class="btn btn-ghost" onclick="window.pickReportOnMap()">Pick on map</button>
         <button id="report-use-location" class="btn btn-ghost" onclick="window.useMyLocationForReport()">Use my location</button>
       </div>
       <div class="report-row">
@@ -2154,6 +2162,12 @@ header {
 .report-popup .rp-tag { font-family: var(--mono); font-size: 9px; letter-spacing: 0.04em; color: #f59e0b; font-weight: 600; }
 .report-popup .rp-cat { font-size: 11px; color: var(--text-2); margin: 2px 0 4px; text-transform: capitalize; }
 .report-popup .rp-note { font-size: 12px; color: var(--text); }
+.report-fine { font-size: 10px; color: var(--text-3); margin: -0.3rem 0 0.6rem; }
+.report-actions { justify-content: flex-end; }
+.report-pick-hint { position: fixed; left: 50%; transform: translateX(-50%); top: 64px; z-index: 1200; display: flex; align-items: center; gap: 0.6rem; background: var(--bg-raised); border: 1px solid #f59e0b; border-radius: 6px; padding: 0.45rem 0.6rem 0.45rem 0.8rem; font-family: var(--mono); font-size: 11px; color: var(--text); box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4); }
+.report-pick-hint.hidden { display: none; }
+.report-pin { background: transparent; border: none; }
+.report-pin span { display: block; width: 14px; height: 14px; border-radius: 50%; background: #f59e0b; border: 2px solid #fff; box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.35); }
 
 .filter-scroll {
   display: flex;
@@ -3737,6 +3751,61 @@ export function renderReports(reports) {
   }
 }
 
+let reportPreview = null;
+let reportPickHandler = null;
+
+function reportPinIcon() {
+  return L.divIcon({
+    className: 'report-pin',
+    html: '<span></span>',
+    iconSize: [14, 14],
+    iconAnchor: [7, 7],
+  });
+}
+
+/** A draggable pin showing where the report will land, before it is sent. */
+export function setReportPreview(lat, lng, onMove) {
+  if (!map) return;
+  if (!reportPreview) {
+    reportPreview = L.marker([lat, lng], { draggable: true, icon: reportPinIcon() }).addTo(map);
+    reportPreview.on('dragend', function () {
+      const p = reportPreview.getLatLng();
+      const cb = reportPreview._sbOnMove;
+      if (cb) cb(p.lat, p.lng);
+    });
+  } else {
+    reportPreview.setLatLng([lat, lng]);
+  }
+  reportPreview._sbOnMove = onMove || null;
+}
+
+export function clearReportPreview() {
+  if (reportPreview && map) map.removeLayer(reportPreview);
+  reportPreview = null;
+}
+
+/** One-shot: the next tap on the map chooses the report location. */
+export function startReportPick(onPick) {
+  if (!map) return;
+  stopReportPick();
+  reportPickHandler = function (e) {
+    stopReportPick();
+    onPick(e.latlng.lat, e.latlng.lng);
+  };
+  map.on('click', reportPickHandler);
+  const el = map.getContainer();
+  if (el) el.style.cursor = 'crosshair';
+}
+
+export function stopReportPick() {
+  if (map && reportPickHandler) map.off('click', reportPickHandler);
+  reportPickHandler = null;
+  if (map) {
+    const el = map.getContainer();
+    if (el) el.style.cursor = '';
+  }
+}
+
 /** Reflect the lock state on the map control. */
 function updateLockButton() {
   const btn = document.getElementById('lock-btn');
@@ -4514,7 +4583,7 @@ export function showDeepDive(record) {
 
 window.showDeepDive = showDeepDive;
 `, type: "application/javascript" },
-  "/js/app.js": { content: `import { initMap, updateMap, filterByAgency, filterByExclude, filterNearby, setMapUserLocation, removeMapUserLocation, applySearchFilter, unpinMapView, initReportLayer, renderReports, currentMapCenter } from './map.js';
+  "/js/app.js": { content: `import { initMap, updateMap, filterByAgency, filterByExclude, filterNearby, setMapUserLocation, removeMapUserLocation, applySearchFilter, unpinMapView, initReportLayer, renderReports, currentMapCenter, setReportPreview, clearReportPreview, startReportPick, stopReportPick } from './map.js';
 import { updateCards, filterCards, highlightCard, setSort, setGroup, setCategory, setBookmarkMode, renderSkeletons } from './cards.js';
 window.toggleBookmarkMode = function() { var btn = document.getElementById('btn-bookmarks'); var active = btn.classList.toggle('active'); setBookmarkMode(active); btn.textContent = active ? '\u2605' : '\u2606'; };
 import { showDeepDive } from './deepdive.js';
@@ -4551,14 +4620,16 @@ async function loadReports() {
 window.openReport = function () {
   var modal = document.getElementById('report-modal');
   if (!modal) return;
-  var c = currentMapCenter();
-  if (c) {
-    reportLat = c.lat;
-    reportLng = c.lng;
-    document.getElementById('report-loc-label').textContent =
-      'Using map centre (' + c.lat.toFixed(4) + ', ' + c.lng.toFixed(4) + ')';
+  if (reportLat == null) {
+    var c = currentMapCenter();
+    if (c) {
+      reportLat = c.lat;
+      reportLng = c.lng;
+      document.getElementById('report-loc-label').textContent =
+        'Using map centre (' + c.lat.toFixed(4) + ', ' + c.lng.toFixed(4) + ')';
+      reportAccuracyM = null;
+    }
   }
-  reportAccuracyM = null;
   var status = document.getElementById('report-status');
   status.textContent = '';
   status.classList.remove('error');
@@ -4574,6 +4645,44 @@ window.closeReport = function () {
   modal.classList.add('hidden');
 };
 
+function setReportLocation(lat, lng, label) {
+  reportLat = lat;
+  reportLng = lng;
+  reportAccuracyM = null;
+  setReportPreview(lat, lng, function (la, ln) {
+    reportLat = la;
+    reportLng = ln;
+    document.getElementById('report-loc-label').textContent =
+      'Pinned on map (' + la.toFixed(4) + ', ' + ln.toFixed(4) + ') - drag to adjust';
+  });
+  var el = document.getElementById('report-loc-label');
+  if (el) {
+    el.textContent = label + ' (' + lat.toFixed(4) + ', ' + lng.toFixed(4) + ') - drag the pin to adjust';
+  }
+}
+
+window.pickReportOnMap = function () {
+  var modal = document.getElementById('report-modal');
+  if (modal) {
+    modal.classList.remove('open');
+    modal.classList.add('hidden');
+  }
+  var hint = document.getElementById('report-pick-hint');
+  if (hint) hint.classList.remove('hidden');
+  startReportPick(function (lat, lng) {
+    if (hint) hint.classList.add('hidden');
+    setReportLocation(lat, lng, 'Pinned on map');
+    window.openReport();
+  });
+};
+
+window.cancelReportPick = function () {
+  stopReportPick();
+  var hint = document.getElementById('report-pick-hint');
+  if (hint) hint.classList.add('hidden');
+  window.openReport();
+};
+
 window.useMyLocationForReport = function () {
   var label = document.getElementById('report-loc-label');
   if (!navigator.geolocation) {
@@ -4582,10 +4691,10 @@ window.useMyLocationForReport = function () {
   }
   label.textContent = 'Locating...';
   navigator.geolocation.getCurrentPosition(function (pos) {
-    reportLat = pos.coords.latitude;
-    reportLng = pos.coords.longitude;
+    setReportLocation(pos.coords.latitude, pos.coords.longitude, 'Using my location');
     reportAccuracyM = Math.round(pos.coords.accuracy || 0);
-    label.textContent = 'Using my location (' + reportLat.toFixed(4) + ', ' + reportLng.toFixed(4) + ')';
+    label.textContent = 'Using my location (' + reportLat.toFixed(4) + ', ' + reportLng.toFixed(4) +
+      ', ~' + reportAccuracyM + 'm) - drag the pin to adjust';
   }, function () {
     label.textContent = 'No location - using the map centre';
   }, { enableHighAccuracy: true, maximumAge: 5000, timeout: 10000 });
@@ -4621,6 +4730,10 @@ window.submitReport = async function () {
       return;
     }
     window.closeReport();
+    reportLat = null;
+    reportLng = null;
+    reportAccuracyM = null;
+    clearReportPreview();
     await loadReports();
   } catch (err) {
     status.textContent = 'Could not send: ' + err.message;
