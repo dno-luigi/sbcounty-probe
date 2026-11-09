@@ -72,7 +72,7 @@ These look like bugs when met cold. Do not "fix" them.
 
 ```bash
 node --check worker.js
-node --test test/                       # 15 tests
+node --test test/                       # 20 tests
 npx wrangler deploy --dry-run           # config and bundle, deploys nothing
 curl -s https://watcher.ai-n.org/api/health
 ```
@@ -100,3 +100,4 @@ will report the old values.
 | `wrangler.jsonc` | bindings and cron, reproducing the deployed Worker |
 | `test/health.test.mjs` | the reporting count rule behind `/api/health` |
 | `test/cadence.test.mjs` | the next-run scheduling rule |
+| `test/reports.test.mjs` | the anonymous report rules: categories, county box, note cleaning |

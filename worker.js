@@ -1412,6 +1412,8 @@ async function handleApi(request, env, ctx) {
   if (path === "/api/analytics/response-times") return handleResponseTimes(env);
   if (path === "/api/analytics/zip-density") return handleZipDensity(env);
   if (path === "/api/analytics/route-alerts" && request.method === "POST") return handleRouteAlerts(request, env);
+  if (path === "/api/reports" && request.method === "GET") return handleListReports(env);
+  if (path === "/api/reports" && request.method === "POST") return handleCreateReport(request, env);
   if (path === "/api/codes") return handleCodes();
   if (path === "/api/metrics") return handleMetrics(env);
   if (path === "/api/scrape" && request.method === "POST") return handleScrapeTrigger(env, ctx);
@@ -1532,6 +1534,109 @@ async function handleGeo(request, env) {
   return json({ records: result.results || [] });
 }
 __name(handleGeo, "handleGeo");
+var REPORT_CATEGORIES = ["police", "fire", "medical", "traffic", "other"];
+var REPORT_TTL_MS = 6 * 60 * 60 * 1e3;
+var REPORT_RATE_MS = 3 * 60 * 1e3;
+var REPORT_NOTE_MAX = 280;
+
+/** Only these categories are accepted, so the badge on the map means something. */
+function isReportCategory(value) {
+  return typeof value === "string" && REPORT_CATEGORIES.indexOf(value) !== -1;
+}
+
+/** Reports must land inside the same county box the geocoder is bounded by. */
+function isReportInBBox(lat, lng) {
+  const la = Number(lat);
+  const ln = Number(lng);
+  if (!Number.isFinite(la) || !Number.isFinite(ln)) return false;
+  return la >= BBOX.minLat && la <= BBOX.maxLat && ln >= BBOX.minLng && ln <= BBOX.maxLng;
+}
+
+/** Notes are plain text only: no control characters, collapsed, trimmed, capped. */
+function cleanReportNote(value) {
+  if (typeof value !== "string") return "";
+  return value
+    .replace(/[\u0000-\u001f\u007f]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, REPORT_NOTE_MAX);
+}
+
+/** A short non-reversible fingerprint of the caller, used only for rate limiting. */
+async function reportClientKey(request) {
+  const raw = request.headers.get("CF-Connecting-IP") || request.headers.get("X-Forwarded-For") || "";
+  const ip = raw.split(",")[0].trim();
+  if (!ip) return null;
+  const bytes = new TextEncoder().encode("sbcd-report:" + ip);
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest)).slice(0, 12).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+async function handleListReports(env) {
+  const now = Date.now();
+  const rows = await env.DISPATCH_D1.prepare(
+    "SELECT id, created_at, category, note, lat, lng, confirmations FROM user_reports WHERE expires_at > ? ORDER BY created_at DESC LIMIT 200"
+  ).bind(now).all();
+  return json({
+    reports: rows.results || [],
+    unverified: true,
+    ttl_hours: REPORT_TTL_MS / 36e5
+  });
+}
+
+async function handleCreateReport(request, env) {
+  let body;
+  try {
+    body = await request.json();
+  } catch (err) {
+    return json({ error: "Invalid JSON body" }, 400);
+  }
+  if (!isReportCategory(body?.category)) {
+    return json({ error: "Unknown category" }, 400);
+  }
+  const lat = Number(body?.lat);
+  const lng = Number(body?.lng);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+    return json({ error: "lat and lng are required" }, 400);
+  }
+  if (!isReportInBBox(lat, lng)) {
+    return json({ error: "That location is outside San Bernardino County" }, 400);
+  }
+  const note = cleanReportNote(body?.note);
+  const accuracyRaw = Number(body?.accuracy_m);
+  const accuracy = Number.isFinite(accuracyRaw) ? Math.max(0, Math.round(accuracyRaw)) : null;
+
+  const key = await reportClientKey(request);
+  if (key) {
+    const last = await env.DISPATCH_KV.get("report_rl:" + key, "json");
+    if (last && Date.now() - last < REPORT_RATE_MS) {
+      return json({ error: "Please wait a few minutes before reporting again" }, 429);
+    }
+    await env.DISPATCH_KV.put("report_rl:" + key, JSON.stringify(Date.now()), { expirationTtl: 180 });
+  }
+
+  const now = Date.now();
+  const id = crypto.randomUUID();
+  const expiresAt = now + REPORT_TTL_MS;
+  await env.DISPATCH_D1.prepare(
+    "INSERT INTO user_reports (id, created_at, category, note, lat, lng, accuracy_m, confirmations, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)"
+  ).bind(id, now, body.category, note, lat, lng, accuracy, expiresAt).run();
+  return json({
+    ok: true,
+    report: { id, created_at: now, category: body.category, note, lat, lng, confirmations: 0 },
+    expires_at: expiresAt
+  }, 201);
+}
+
+/** Reports are short-lived; sweep the expired ones on every cron run. */
+async function purgeExpiredReports(env) {
+  try {
+    await env.DISPATCH_D1.prepare("DELETE FROM user_reports WHERE expires_at <= ?").bind(Date.now()).run();
+  } catch (err) {
+    console.error("Report purge failed:", err.message);
+  }
+}
+
 function handleCodes() {
   return json({ call_types: CALL_TYPES, dispositions: DISPOSITIONS, agencies: AGENCY_NAMES });
 }
@@ -1838,6 +1943,7 @@ var STATIC_ASSETS = {
       <button id="btn-scrape" class="btn btn-primary" onclick="triggerScrape()">Scrape</button>
       <button id="btn-bookmarks" class="btn btn-ghost" onclick="toggleBookmarkMode()">☆</button>
       <button id="btn-metrics" class="btn btn-ghost" onclick="showMetrics()">Analytics</button>
+      <button id="btn-report" class="btn btn-primary" onclick="window.openReport()">Report</button>
     </div>
   </header>
   <main>
@@ -1869,6 +1975,33 @@ var STATIC_ASSETS = {
       <div id="card-grid"></div>
     </div>
   </main>
+  <div id="report-modal" class="modal hidden">
+    <div class="modal-content">
+      <button class="modal-close" onclick="window.closeReport()">&times;</button>
+      <h2>Report what you can see</h2>
+      <p class="report-hint">Anonymous. Shown to everyone as an unverified community report for six hours. This is not a way to call for help - dial 911.</p>
+      <div class="report-row">
+        <select id="report-category">
+          <option value="police">Police activity</option>
+          <option value="fire">Fire</option>
+          <option value="medical">Medical</option>
+          <option value="traffic">Traffic or crash</option>
+          <option value="other">Something else</option>
+        </select>
+      </div>
+      <div class="report-row">
+        <input id="report-note" type="text" maxlength="280" placeholder="What are you seeing? (optional)">
+      </div>
+      <div class="report-row report-loc">
+        <span id="report-loc-label">Using the map centre</span>
+        <button id="report-use-location" class="btn btn-ghost" onclick="window.useMyLocationForReport()">Use my location</button>
+      </div>
+      <div class="report-row">
+        <button id="report-submit" class="btn btn-primary" onclick="window.submitReport()">Submit report</button>
+      </div>
+      <div id="report-status" class="report-status"></div>
+    </div>
+  </div>
   <div id="deepdive-modal" class="modal hidden">
     <div class="modal-content">
       <button class="modal-close" onclick="closeModal()">&times;</button>
@@ -2011,6 +2144,16 @@ header {
 }
 #search:focus { border-color: var(--accent); }
 #search::placeholder { color: var(--text-3); }
+
+.report-hint { font-size: 11px; color: var(--text-3); margin: 0 0 0.75rem; line-height: 1.45; }
+.report-row { display: flex; gap: 0.5rem; align-items: center; margin-bottom: 0.6rem; }
+.report-row select, .report-row input { flex: 1; min-width: 0; background: var(--bg); border: 1px solid var(--border); border-radius: 4px; color: var(--text); font-family: var(--mono); font-size: 12px; padding: 0.4rem 0.6rem; }
+.report-loc { justify-content: space-between; font-size: 11px; color: var(--text-2); }
+.report-status { min-height: 1em; font-family: var(--mono); font-size: 11px; color: var(--text-2); }
+.report-status.error { color: #e94560; }
+.report-popup .rp-tag { font-family: var(--mono); font-size: 9px; letter-spacing: 0.04em; color: #f59e0b; font-weight: 600; }
+.report-popup .rp-cat { font-size: 11px; color: var(--text-2); margin: 2px 0 4px; text-transform: capitalize; }
+.report-popup .rp-note { font-size: 12px; color: var(--text); }
 
 .filter-scroll {
   display: flex;
@@ -3060,6 +3203,7 @@ let userPulse = null;
 let userWatchId = null;
 let viewPinned = false;
 const LOCK_KEY = 'sb-map-lock';
+let reportGroup = null;
 
 const DEFAULT_CENTER = [34.85, -117.2];
 const DEFAULT_ZOOM = 10;
@@ -3541,6 +3685,55 @@ export function applySearchFilter(term) {
     } else if (markerGroup.hasLayer(m)) {
       markerGroup.removeLayer(m);
     }
+  }
+}
+
+function escapeReportHtml(value) {
+  return String(value == null ? '' : value).replace(/[&<>"']/g, function (c) {
+    if (c === '&') return '&amp;';
+    if (c === '<') return '&lt;';
+    if (c === '>') return '&gt;';
+    if (c === '"') return '&quot;';
+    return '&#39;';
+  });
+}
+
+/** The map centre, used as the default location for a new report. */
+export function currentMapCenter() {
+  if (!map) return null;
+  const c = map.getCenter();
+  return { lat: c.lat, lng: c.lng, zoom: map.getZoom() };
+}
+
+/** Community reports live in their own layer so agency filters never hide them. */
+export function initReportLayer() {
+  if (!reportGroup) reportGroup = L.layerGroup().addTo(map);
+}
+
+function buildReportPopup(r) {
+  const when = timeAgo(new Date(r.created_at).toISOString());
+  const note = r.note ? '<div class="rp-note">' + escapeReportHtml(r.note) + '</div>' : '';
+  return '<div class="report-popup">' +
+    '<div class="rp-tag">COMMUNITY REPORT &middot; UNVERIFIED</div>' +
+    '<div class="rp-cat">' + escapeReportHtml(r.category) + ' &middot; ' + when + '</div>' +
+    note + '</div>';
+}
+
+export function renderReports(reports) {
+  if (!reportGroup) reportGroup = L.layerGroup().addTo(map);
+  reportGroup.clearLayers();
+  for (const r of reports || []) {
+    if (!Number.isFinite(r.lat) || !Number.isFinite(r.lng)) continue;
+    const m = L.circleMarker([r.lat, r.lng], {
+      radius: 8,
+      color: '#f59e0b',
+      weight: 2,
+      dashArray: '3 3',
+      fillColor: '#f59e0b',
+      fillOpacity: 0.3,
+      opacity: 0.95,
+    }).addTo(reportGroup);
+    m.bindPopup(buildReportPopup(r));
   }
 }
 
@@ -4321,7 +4514,7 @@ export function showDeepDive(record) {
 
 window.showDeepDive = showDeepDive;
 `, type: "application/javascript" },
-  "/js/app.js": { content: `import { initMap, updateMap, filterByAgency, filterByExclude, filterNearby, setMapUserLocation, removeMapUserLocation, applySearchFilter, unpinMapView } from './map.js';
+  "/js/app.js": { content: `import { initMap, updateMap, filterByAgency, filterByExclude, filterNearby, setMapUserLocation, removeMapUserLocation, applySearchFilter, unpinMapView, initReportLayer, renderReports, currentMapCenter } from './map.js';
 import { updateCards, filterCards, highlightCard, setSort, setGroup, setCategory, setBookmarkMode, renderSkeletons } from './cards.js';
 window.toggleBookmarkMode = function() { var btn = document.getElementById('btn-bookmarks'); var active = btn.classList.toggle('active'); setBookmarkMode(active); btn.textContent = active ? '\u2605' : '\u2606'; };
 import { showDeepDive } from './deepdive.js';
@@ -4339,6 +4532,103 @@ window._currentSearch = '';
 window._currentAgency = '';
 window._excludedAgencies = excludedAgencies;
 window._nearbyRadiusMi = nearbyRadiusMi;
+
+var reportLat = null;
+var reportLng = null;
+var reportAccuracyM = null;
+
+async function loadReports() {
+  try {
+    var resp = await fetch('/api/reports');
+    if (!resp.ok) return;
+    var data = await resp.json();
+    if (data && data.reports) renderReports(data.reports);
+  } catch (err) {
+    console.error('Reports failed:', err);
+  }
+}
+
+window.openReport = function () {
+  var modal = document.getElementById('report-modal');
+  if (!modal) return;
+  var c = currentMapCenter();
+  if (c) {
+    reportLat = c.lat;
+    reportLng = c.lng;
+    document.getElementById('report-loc-label').textContent =
+      'Using map centre (' + c.lat.toFixed(4) + ', ' + c.lng.toFixed(4) + ')';
+  }
+  reportAccuracyM = null;
+  var status = document.getElementById('report-status');
+  status.textContent = '';
+  status.classList.remove('error');
+  document.getElementById('report-note').value = '';
+  modal.classList.remove('hidden');
+  requestAnimationFrame(function () { modal.classList.add('open'); });
+};
+
+window.closeReport = function () {
+  var modal = document.getElementById('report-modal');
+  if (!modal) return;
+  modal.classList.remove('open');
+  modal.classList.add('hidden');
+};
+
+window.useMyLocationForReport = function () {
+  var label = document.getElementById('report-loc-label');
+  if (!navigator.geolocation) {
+    label.textContent = 'Location is not supported here';
+    return;
+  }
+  label.textContent = 'Locating...';
+  navigator.geolocation.getCurrentPosition(function (pos) {
+    reportLat = pos.coords.latitude;
+    reportLng = pos.coords.longitude;
+    reportAccuracyM = Math.round(pos.coords.accuracy || 0);
+    label.textContent = 'Using my location (' + reportLat.toFixed(4) + ', ' + reportLng.toFixed(4) + ')';
+  }, function () {
+    label.textContent = 'No location - using the map centre';
+  }, { enableHighAccuracy: true, maximumAge: 5000, timeout: 10000 });
+};
+
+window.submitReport = async function () {
+  var status = document.getElementById('report-status');
+  var btn = document.getElementById('report-submit');
+  if (reportLat == null || reportLng == null) {
+    status.textContent = 'Pick a location first';
+    status.classList.add('error');
+    return;
+  }
+  btn.disabled = true;
+  status.textContent = 'Sending...';
+  status.classList.remove('error');
+  try {
+    var resp = await fetch('/api/reports', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        category: document.getElementById('report-category').value,
+        note: document.getElementById('report-note').value,
+        lat: reportLat,
+        lng: reportLng,
+        accuracy_m: reportAccuracyM,
+      }),
+    });
+    var data = await resp.json().catch(function () { return {}; });
+    if (!resp.ok) {
+      status.textContent = data.error || ('Could not send (' + resp.status + ')');
+      status.classList.add('error');
+      return;
+    }
+    window.closeReport();
+    await loadReports();
+  } catch (err) {
+    status.textContent = 'Could not send: ' + err.message;
+    status.classList.add('error');
+  } finally {
+    btn.disabled = false;
+  }
+};
 
 async function fetchLatest(limit = 500) {
   const resp = await fetch(\`/api/dispatch/latest?limit=\${limit}\`);
@@ -4662,6 +4952,7 @@ async function refresh() {
     }
     updateStatsBar(stats);
     renderAgencyFilters(agencies);
+    await loadReports();
     if (currentAgency || currentSearch || excludedAgencies.size || nearbyMode) {
       applyFilters();
     }
@@ -4673,6 +4964,7 @@ async function refresh() {
 document.addEventListener('DOMContentLoaded', async () => {
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
   initMap();
+  initReportLayer();
 
   document.getElementById('search').addEventListener('input', (e) => {
     currentSearch = e.target.value;
@@ -4799,6 +5091,7 @@ var index_default = {
         const scrapeResults = await runScraper(env);
         const storageResults = await processScrapeResults(env, scrapeResults);
         const purgeResults = await purgeOldRecords(env, 8);
+        await purgeExpiredReports(env);
         const agencyErrors = scrapeResults.errors || [];
         const reportingAgencies = countReportingAgencies(scrapeResults);
         const totalAgencies = (ALL_AGENCY_CODES || []).length;
@@ -4879,7 +5172,10 @@ export {
   index_default as default,
   countReportingAgencies,
   computeNextScrapeAt,
-  computeSlowInterval
+  computeSlowInterval,
+  isReportCategory,
+  isReportInBBox,
+  cleanReportNote
 };
 //# sourceMappingURL=worker.js.map
 
