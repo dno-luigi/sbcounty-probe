@@ -128,3 +128,14 @@ run, not the one in flight.
 - `/api/admin/*` is declared in the router and answers **404** without credentials. It
   was not exercised.
 - `wrangler deploy` from this repo is the only deploy path. There is no CI.
+
+## 2026-11-09 - anonymous community reports
+
+Owner chose the shape: a real D1 table, public but labelled unverified, geo-fenced with a per-IP limit.
+
+- Storage: new table `user_reports` (id, created_at, category, note, lat, lng, accuracy_m, confirmations, expires_at) plus `idx_user_reports_expires`. It was created out-of-band with `CREATE TABLE IF NOT EXISTS`, so a fresh environment needs that DDL before reports work.
+- Routes: `GET /api/reports` returns active rows (expires_at > now, newest first, max 200); `POST /api/reports` accepts `{category, note, lat, lng, accuracy_m}`.
+- Guarantees: category allowlist (police/fire/medical/traffic/other); coordinates must fall inside BBOX; notes are stripped of control characters, collapsed and capped at 280; one report per hashed CF-Connecting-IP every 3 minutes, held in KV under `report_rl:<sha256 prefix>`; every row expires after 6 hours and `purgeExpiredReports()` sweeps on each cron run.
+- UI: header `Report` button opens `#report-modal`, which defaults to the map centre and offers an optional "use my location" button. Reports draw in their own amber dashed layer (`initReportLayer`/`renderReports` in map.js) tagged "COMMUNITY REPORT - UNVERIFIED", so agency filters never hide them and they are not mistakable for county dispatch data.
+- Tests: `test/reports.test.mjs` (5 tests); suite is 20.
+- Open: no moderation queue - any in-county pin is public immediately. `confirmations` exists in the schema but nothing increments it yet, so there is no way for other users to corroborate a report.
