@@ -158,3 +158,11 @@ Dispatch search already covered street names and incident types: `filterCards()`
 - `reportMatchesSearch()` is the report-side rule: category, note, plus the confirmed call's type and location. That makes "fire" (category), "Baseline" (a street in a note) and "TC" (a confirmed call type) all find reports.
 - The search term combines with the existing report filter: All / Confirmed / Off still applies first, then the term narrows what is left.
 - No server change; `/api/reports` has no `q` parameter and the filtering stays client-side like the dispatch search.
+
+## 2026-11-10 - the "data may be stale" banner fired on a healthy Worker
+
+- The banner was client-only: `updateStatsBar()` compared the last completed run's timestamp against a **10 minute** threshold. Pacing deliberately idles 3 -> 6 -> 12 -> 15 minutes in slow mode and each run takes ~3.5 minutes, so 10+ minutes between completed runs is normal and the banner appeared during ordinary quiet stretches.
+- Now the banner follows the server's own verdict: `refresh()` also fetches `/api/freshness`, and `stalenessAgeMin()` shows the banner only when that reply says `stale: true` (newest scraped row older than the 45-minute window), or - when freshness cannot be read - when the last completed run is itself older than 45 minutes. It states the age instead of a generic warning.
+- A missing `age_min` falls back to 45 rather than reading as 0, and a reported age is floored at 1 minute, so the banner never says "last scrape 0m ago".
+- The 45-minute window is unchanged; `/api/freshness` and `validateFreshness()` already used it. No health counter, threshold or cron pacing was touched.
+- Service worker cache bumped to `sb-dispatch-v4`, because `/js/*` is cache-first and a fixed cache name pins the previous module.

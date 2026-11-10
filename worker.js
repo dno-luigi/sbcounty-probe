@@ -2154,7 +2154,7 @@ async function handleDiscover(env) {
 __name(handleDiscover, "handleDiscover");
 var STATIC_ASSETS = {
   "/icon.svg": { content: "\"<svg xmlns=\\\"http://www.w3.org/2000/svg\\\" width=\\\"512\\\" height=\\\"512\\\" viewBox=\\\"0 0 512 512\\\"><rect width=\\\"512\\\" height=\\\"512\\\" rx=\\\"80\\\" fill=\\\"#1a1a2e\\\"/><text x=\\\"256\\\" y=\\\"340\\\" font-size=\\\"280\\\" text-anchor=\\\"middle\\\" fill=\\\"#e94560\\\" font-family=\\\"sans-serif\\\" font-weight=\\\"bold\\\">S</text></svg>\"", contentType: "image/svg+xml" },
-  "/sw.js": { content: "const CACHE = 'sb-dispatch-v3';\nconst STATIC = ['/','/index.html','/css/dashboard.css','/js/app.js','/js/cards.js','/js/map.js','/js/deepdive.js','/js/app-data.js','/manifest.json'];\nself.addEventListener('install', e => { self.skipWaiting(); e.waitUntil(caches.open(CACHE).then(c => c.addAll(STATIC).catch(() => {}))); });\nself.addEventListener('activate', e => e.waitUntil(caches.keys().then(function(ks){return Promise.all(ks.filter(function(k){return k !== CACHE;}).map(function(k){return caches.delete(k);}));}).then(function(){return self.clients.claim();})));\nself.addEventListener('fetch', e => {\n  const url = new URL(e.request.url);\n  if (url.pathname.startsWith('/api/')) {\n    e.respondWith(fetch(e.request).then(r => { const c = r.clone(); caches.open(CACHE).then(c2 => c2.put(e.request, c)); return r; }).catch(() => caches.match(e.request)));\n  } else {\n    e.respondWith(caches.match(e.request).then(r => r || fetch(e.request).then(res => { const c = res.clone(); caches.open(CACHE).then(c2 => c2.put(e.request, c)); return res; }).catch(() => caches.match('/'))));\n  }\n});", contentType: "application/javascript" },
+  "/sw.js": { content: "const CACHE = 'sb-dispatch-v4';\nconst STATIC = ['/','/index.html','/css/dashboard.css','/js/app.js','/js/cards.js','/js/map.js','/js/deepdive.js','/js/app-data.js','/manifest.json'];\nself.addEventListener('install', e => { self.skipWaiting(); e.waitUntil(caches.open(CACHE).then(c => c.addAll(STATIC).catch(() => {}))); });\nself.addEventListener('activate', e => e.waitUntil(caches.keys().then(function(ks){return Promise.all(ks.filter(function(k){return k !== CACHE;}).map(function(k){return caches.delete(k);}));}).then(function(){return self.clients.claim();})));\nself.addEventListener('fetch', e => {\n  const url = new URL(e.request.url);\n  if (url.pathname.startsWith('/api/')) {\n    e.respondWith(fetch(e.request).then(r => { const c = r.clone(); caches.open(CACHE).then(c2 => c2.put(e.request, c)); return r; }).catch(() => caches.match(e.request)));\n  } else {\n    e.respondWith(caches.match(e.request).then(r => r || fetch(e.request).then(res => { const c = res.clone(); caches.open(CACHE).then(c2 => c2.put(e.request, c)); return res; }).catch(() => caches.match('/'))));\n  }\n});", contentType: "application/javascript" },
   "/manifest.json": { content: "{\"id\":\"/\",\"name\":\"SB County Dispatch\",\"short_name\":\"SB Dispatch\",\"description\":\"Real-time San Bernardino County dispatch calls\",\"start_url\":\"/\",\"display\":\"standalone\",\"background_color\":\"#1a1a2e\",\"theme_color\":\"#1a1a2e\",\"icons\":[{\"src\":\"/icon.svg\",\"sizes\":\"any\",\"type\":\"image/svg+xml\",\"purpose\":\"any\"},{\"src\":\"/icon.svg\",\"sizes\":\"512x512\",\"type\":\"image/svg+xml\",\"purpose\":\"maskable\"}],\"screenshots\":[{\"src\":\"/icon.svg\",\"sizes\":\"1280x720\",\"type\":\"image/svg+xml\",\"form_factor\":\"wide\",\"label\":\"SB County Dispatch Dashboard\"},{\"src\":\"/icon.svg\",\"sizes\":\"512x1024\",\"type\":\"image/svg+xml\",\"label\":\"SB County Dispatch Mobile\"}]}", contentType: "application/manifest+json" },
   "/js/app-data.js": { content: `export const APP_DATA = ${JSON.stringify(WEB_DATA)};
 `, type: "application/javascript" },
@@ -5390,6 +5390,12 @@ async function fetchStats() {
   return resp.json();
 }
 
+async function fetchFreshness() {
+  const resp = await fetch('/api/freshness');
+  if (!resp.ok) return null;
+  return resp.json();
+}
+
 async function fetchAgencies() {
   const resp = await fetch('/api/dispatch/agencies');
   if (!resp.ok) return null;
@@ -5405,7 +5411,32 @@ function timeAgoShort(ts) {
   return \`\${Math.floor(diff / 86400)}d ago\`;
 }
 
-function updateStatsBar(stats) {
+/**
+ * How stale the data really is, in minutes, or null when it is fine.
+ *
+ * The scraper deliberately idles between runs (3 -> 6 -> 12 -> 15 minutes in slow
+ * mode) and each run takes about three, so last_run.timestamp can be eighteen
+ * minutes old on a perfectly healthy Worker. The old ten-minute check on that
+ * timestamp therefore showed the banner during every quiet stretch. The server
+ * measures freshness against the newest scraped row over a 45-minute window at
+ * /api/freshness, so that verdict decides the banner; the timestamp is only a
+ * fallback for when freshness cannot be read.
+ */
+function stalenessAgeMin(stats, freshness) {
+  if (freshness && freshness.stale === false) return null;
+  if (freshness && freshness.stale === true) {
+    const raw = freshness.age_min;
+    const age = raw == null ? NaN : Number(raw);
+    if (!Number.isFinite(age)) return 45;
+    return Math.max(1, Math.round(age));
+  }
+  const stamp = stats && stats.last_run ? stats.last_run.timestamp : null;
+  if (!stamp) return null;
+  const age = (Date.now() - new Date(stamp).getTime()) / 60000;
+  return age > 45 ? Math.round(age) : null;
+}
+
+function updateStatsBar(stats, freshness) {
   const el = document.getElementById('stats-bar');
   if (!el || !stats) return;
   const agencies = Object.keys(stats.by_agency || {}).length;
@@ -5415,8 +5446,11 @@ function updateStatsBar(stats) {
 el.innerHTML = \`<span class="val">\${(stats.total_records || 0).toLocaleString()}</span> records &middot; <span class="val">\${agencies}</span> agencies &middot; scraped <span class="val">\${scrapeAgo}</span> &middot; refreshed <span class="val">\${refreshed}</span>\`;
   const banner = document.getElementById('stale-banner');
   if (banner) {
-    const ageMin = lastScrape ? (Date.now() - new Date(lastScrape).getTime()) / 60000 : 999;
-    banner.classList.toggle('hidden', ageMin < 10);
+    const staleAgeMin = stalenessAgeMin(stats, freshness);
+    banner.classList.toggle('hidden', staleAgeMin === null);
+    if (staleAgeMin !== null) {
+      banner.textContent = 'Data may be stale \u2014 last scrape ' + staleAgeMin + 'm ago';
+    }
   }
 }
 
@@ -5689,17 +5723,18 @@ window.setNearbyRadiusImmediate = function (mi) {
 
 async function refresh() {
   try {
-    const [data, stats, agencies] = await Promise.all([
+    const [data, stats, agencies, freshness] = await Promise.all([
       fetchLatest(),
       fetchStats(),
       fetchAgencies(),
+      fetchFreshness().catch(function () { return null; }),
     ]);
     lastRefreshTime = Date.now();
     if (data?.records) {
       updateCards(data.records);
       updateMap(data.records);
     }
-    updateStatsBar(stats);
+    updateStatsBar(stats, freshness);
     renderAgencyFilters(agencies);
     await loadReports();
     if (currentAgency || currentSearch || excludedAgencies.size || nearbyMode) {
