@@ -166,3 +166,11 @@ Dispatch search already covered street names and incident types: `filterCards()`
 - A missing `age_min` falls back to 45 rather than reading as 0, and a reported age is floored at 1 minute, so the banner never says "last scrape 0m ago".
 - The 45-minute window is unchanged; `/api/freshness` and `validateFreshness()` already used it. No health counter, threshold or cron pacing was touched.
 - Service worker cache bumped to `sb-dispatch-v4`, because `/js/*` is cache-first and a fixed cache name pins the previous module.
+
+## 2026-11-10 - press and hold the map to report from that spot
+
+- A 550 ms hold anywhere on the map opens the same report dialog as "Pick on map", with the amber preview pin already on the spot that was held and still draggable. One report path, not two: `fireHold()` converts the held point with `containerPointToLatLng()` and calls `window.openReportAt(lat, lng)` in app.js, which reuses `setReportLocation()` and `openReport()`.
+- Cancelling is what keeps the map usable. Moving more than 10 px, releasing, or a `pointercancel` aborts the hold, so panning, zooming and pinching never open a dialog. A hold that starts on a Leaflet control or an open popup is ignored.
+- The click produced by letting go is swallowed at window capture for 700 ms, otherwise it would open or dismiss a county popup underneath the dialog. `contextmenu` is suppressed while a hold is in flight so the phone menu does not cover the map, and `#map` sets `-webkit-touch-callout: none` and `user-select: none` so iOS does not begin a text selection.
+- Because a hold has no visible affordance, the dialog's fine print says so: "Holding your finger on the map starts a report right there."
+- Cache name `sb-dispatch-v5`.
