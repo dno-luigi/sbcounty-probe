@@ -174,3 +174,9 @@ Dispatch search already covered street names and incident types: `filterCards()`
 - The click produced by letting go is swallowed at window capture for 700 ms, otherwise it would open or dismiss a county popup underneath the dialog. `contextmenu` is suppressed while a hold is in flight so the phone menu does not cover the map, and `#map` sets `-webkit-touch-callout: none` and `user-select: none` so iOS does not begin a text selection.
 - Because a hold has no visible affordance, the dialog's fine print says so: "Holding your finger on the map starts a report right there."
 - Cache name `sb-dispatch-v5`.
+
+## 2026-11-10 - an abandoned report leaves no pin
+
+- Closing the report dialog without submitting used to leave the amber preview pin on the map and the pending coordinates in memory, so the next open showed the old spot and a pin outlived a report that never existed. `closeReport()` now clears the preview, nulls `reportLat` / `reportLng` / `reportAccuracyM` and resets the location label, so the next report starts from the map centre again.
+- The "Pick on map" flow is deliberately untouched: it hides the dialog directly rather than through `closeReport()`, so a location chosen mid-selection survives picking and cancelling. Submitting already cleared everything on success.
+- Cache name `sb-dispatch-v6`.
