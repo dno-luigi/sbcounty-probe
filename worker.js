@@ -3509,6 +3509,7 @@ let reportGroup = null;
 let lastReports = [];
 let reportLegendControl = null;
 let reportFilter = 'all';
+let reportSearch = '';
 try {
   const savedFilter = localStorage.getItem('sb-report-filter');
   if (savedFilter === 'confirmed' || savedFilter === 'off') reportFilter = savedFilter;
@@ -4076,6 +4077,7 @@ export function renderReports(reports) {
     if (hidden.has(r.id)) continue;
     if (reportFilter === 'off') continue;
     if (reportFilter === 'confirmed' && !r.county_match) continue;
+    if (reportSearch && !reportMatchesSearch(r, reportSearch)) continue;
     const colour = r.county_match ? '#22c55e' : '#f59e0b';
     const m = L.circleMarker([r.lat, r.lng], {
       radius: r.county_match ? 9 : 8,
@@ -4188,6 +4190,7 @@ export function renderReportList(reports) {
 
   const localHidden = locallyHiddenReports();
   let rows = (reports || []).filter(function (r) { return !localHidden.has(r.id); });
+  if (reportSearch) rows = rows.filter(function (r) { return reportMatchesSearch(r, reportSearch); });
   if (reportFilter === 'confirmed') rows = rows.filter(function (r) { return !!r.county_match; });
   if (reportFilter === 'off') rows = [];
 
@@ -4200,6 +4203,32 @@ export function renderReportList(reports) {
   wrap.classList.remove('hidden');
   if (countEl) countEl.textContent = String(rows.length);
   for (let i = 0; i < rows.length; i++) host.appendChild(reportListRow(rows[i]));
+}
+
+/**
+ * A report matches when the term appears in what a person can actually read
+ * about it: its category (fire, traffic...), its note, or the dispatch call it
+ * was confirmed against. That is the report-side counterpart of searchHit(),
+ * which covers location, call type, call number, disposition and agency.
+ */
+export function reportMatchesSearch(r, term) {
+  const q = String(term || '').trim().toLowerCase();
+  if (!q) return true;
+  const fields = [r.category, r.note];
+  if (r.county_match) fields.push(r.county_match.call_type, r.county_match.location);
+  for (let i = 0; i < fields.length; i++) {
+    const v = fields[i];
+    if (v && String(v).toLowerCase().indexOf(q) !== -1) return true;
+  }
+  return false;
+}
+
+/** The search box drives the report list and pins as well as the dispatch cards. */
+export function setReportSearch(term) {
+  const next = String(term || '').trim().toLowerCase();
+  if (next === reportSearch) return;
+  reportSearch = next;
+  renderReports(lastReports);
 }
 
 /** One report fetch for the map, the list and the owner view alike. */
@@ -5154,7 +5183,7 @@ export function showDeepDive(record) {
 
 window.showDeepDive = showDeepDive;
 `, type: "application/javascript" },
-  "/js/app.js": { content: `import { initMap, updateMap, filterByAgency, filterByExclude, filterNearby, setMapUserLocation, removeMapUserLocation, applySearchFilter, unpinMapView, initReportLayer, initReportLegend, refreshReportFeed, currentMapCenter, setReportPreview, clearReportPreview, startReportPick, stopReportPick } from './map.js';
+  "/js/app.js": { content: `import { initMap, updateMap, filterByAgency, filterByExclude, filterNearby, setMapUserLocation, removeMapUserLocation, applySearchFilter, unpinMapView, initReportLayer, initReportLegend, refreshReportFeed, setReportSearch, currentMapCenter, setReportPreview, clearReportPreview, startReportPick, stopReportPick } from './map.js';
 import { updateCards, filterCards, highlightCard, setSort, setGroup, setCategory, setBookmarkMode, renderSkeletons } from './cards.js';
 window.toggleBookmarkMode = function() { var btn = document.getElementById('btn-bookmarks'); var active = btn.classList.toggle('active'); setBookmarkMode(active); btn.textContent = active ? '\u2605' : '\u2606'; };
 import { showDeepDive } from './deepdive.js';
@@ -5480,6 +5509,7 @@ function applyFilters() {
     filterByExclude(excludedAgencies);
   }
   applySearchFilter(currentSearch);
+  setReportSearch(currentSearch);
   syncUrlParams();
 }
 

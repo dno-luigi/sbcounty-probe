@@ -149,3 +149,12 @@ Owner chose the shape: a real D1 table, public but labelled unverified, geo-fenc
 - **UI.** The padlock in the report list header prompts once for the key, verifies it with `GET /api/reports` (`owner: true` in the reply), keeps it in `localStorage` (`sb-owner-key`) and adds Hide / Restore to each row. A 401/403 forgets the key rather than silently retrying.
 - **Not yet exercised in production:** the secret has to be created by the owner (`wrangler secret put OWNER_REPORT_KEY`, or Workers -> Settings -> Variables), so at time of writing the owner endpoints answer 401 and the hide/restore path is proven only against a stub D1/KV harness and the unit tests.
 - Tests: 27. Map module cache bumped to `sb-dispatch-v3` because `/js/*` is cache-first and a fixed cache name pins the old module.
+
+## 2026-11-10 - search reaches the community reports
+
+Dispatch search already covered street names and incident types: `filterCards()` matches `location`, `call_type`, `call_no`, `dispo` and `agency`, and `applySearchFilter()` applies the same five fields to the map pins. The gap was the crowd layer - reports were never filtered, so searching "fire" hid dispatch cards but left every community pin and row in place.
+
+- `setReportSearch()` is called from `applyFilters()` next to `applySearchFilter()`, so the header search now drives the report list and the report pins with the same term and the same debounce-free input event.
+- `reportMatchesSearch()` is the report-side rule: category, note, plus the confirmed call's type and location. That makes "fire" (category), "Baseline" (a street in a note) and "TC" (a confirmed call type) all find reports.
+- The search term combines with the existing report filter: All / Confirmed / Off still applies first, then the term narrows what is left.
+- No server change; `/api/reports` has no `q` parameter and the filtering stays client-side like the dispatch search.
