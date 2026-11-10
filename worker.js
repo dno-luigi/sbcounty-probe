@@ -1413,7 +1413,7 @@ async function handleApi(request, env, ctx) {
   if (path === "/api/analytics/zip-density") return handleZipDensity(env);
   if (path === "/api/analytics/route-alerts" && request.method === "POST") return handleRouteAlerts(request, env);
   if (path.startsWith("/api/reports/") && request.method === "POST") return handleReportAction(request, env, path);
-  if (path === "/api/reports" && request.method === "GET") return handleListReports(env);
+  if (path === "/api/reports" && request.method === "GET") return handleListReports(request, env);
   if (path === "/api/reports" && request.method === "POST") return handleCreateReport(request, env);
   if (path === "/api/codes") return handleCodes();
   if (path === "/api/metrics") return handleMetrics(env);
@@ -1576,6 +1576,55 @@ async function reportClientKey(request) {
 var REPORT_MATCH_MILES = 0.6;
 var REPORT_MATCH_WINDOW_MS = 30 * 60 * 1e3;
 var REPORT_ABUSE_HIDE_AT = 3;
+var OWNER_KEY_HEADER = "x-owner-key";
+var REPORT_OWNER_TTL_SEC = 24 * 60 * 60;
+
+/** Compare two secrets without leaking length or position through timing. */
+export async function secretEqual(a, b) {
+  const left = String(a == null ? "" : a);
+  const right = String(b == null ? "" : b);
+  if (!left || !right) return false;
+  const enc = new TextEncoder();
+  const pair = await Promise.all([
+    crypto.subtle.digest("SHA-256", enc.encode(left)),
+    crypto.subtle.digest("SHA-256", enc.encode(right))
+  ]);
+  const va = new Uint8Array(pair[0]);
+  const vb = new Uint8Array(pair[1]);
+  let diff = 0;
+  for (let i = 0; i < va.length; i++) diff |= va[i] ^ vb[i];
+  return diff === 0;
+}
+
+/**
+ * Owner moderation is gated on the OWNER_REPORT_KEY secret binding. With no
+ * secret set nothing is authorised, so a fresh environment cannot be moderated
+ * by accident or by an empty header.
+ */
+export async function ownerKeyMatches(request, env) {
+  const expected = env && env.OWNER_REPORT_KEY ? String(env.OWNER_REPORT_KEY) : "";
+  if (!expected) return false;
+  const supplied = request && request.headers && request.headers.get
+    ? request.headers.get(OWNER_KEY_HEADER)
+    : "";
+  if (!supplied) return false;
+  return secretEqual(supplied, expected);
+}
+
+async function loadOwnerHiddenIds(env) {
+  try {
+    const listed = await env.DISPATCH_KV.list({ prefix: "report_owner_hidden:" });
+    return new Set((listed.keys || []).map((k) => k.name.slice("report_owner_hidden:".length)));
+  } catch (err) {
+    console.error("Owner hidden lookup failed:", err.message);
+    return new Set();
+  }
+}
+
+/** A report is public unless the crowd or the owner hid it. */
+export function isReportPubliclyVisible(id, crowdHidden, ownerHidden) {
+  return !crowdHidden.has(id) && !ownerHidden.has(id);
+}
 
 function toRadians(deg) {
   return deg * Math.PI / 180;
@@ -1681,13 +1730,18 @@ async function loadHiddenReportIds(env) {
   }
 }
 
-async function handleListReports(env) {
+async function handleListReports(request, env) {
   const now = Date.now();
+  const owner = await ownerKeyMatches(request, env);
   const rows = await env.DISPATCH_D1.prepare(
     "SELECT id, created_at, category, note, lat, lng, confirmations FROM user_reports WHERE expires_at > ? ORDER BY created_at DESC LIMIT 200"
   ).bind(now).all();
-  const hidden = await loadHiddenReportIds(env);
-  const active = (rows.results || []).filter((r) => !hidden.has(r.id));
+  const crowdHidden = await loadHiddenReportIds(env);
+  const ownerHidden = await loadOwnerHiddenIds(env);
+  const all = rows.results || [];
+  const active = owner
+    ? all
+    : all.filter((r) => isReportPubliclyVisible(r.id, crowdHidden, ownerHidden));
   let candidates = [];
   if (active.length) {
     try {
@@ -1698,17 +1752,23 @@ async function handleListReports(env) {
   }
   const reports = active.map((r) => {
     const match = findCountyMatch(r, candidates);
-    return match ? Object.assign({}, r, { county_match: match }) : r;
+    const out = match ? Object.assign({}, r, { county_match: match }) : Object.assign({}, r);
+    if (owner) {
+      out.owner_hidden = ownerHidden.has(r.id);
+      out.crowd_hidden = crowdHidden.has(r.id);
+    }
+    return out;
   });
   return json({
     reports,
     unverified: true,
-    ttl_hours: REPORT_TTL_MS / 36e5
-  });
+    ttl_hours: REPORT_TTL_MS / 36e5,
+    owner: owner || undefined
+  }, 200, owner ? { "Cache-Control": "no-store" } : {});
 }
 
 async function handleReportAction(request, env, path) {
-  const m = /^\/api\/reports\/([A-Za-z0-9-]{8,64})\/(abuse|confirm)$/.exec(path);
+  const m = /^\/api\/reports\/([A-Za-z0-9-]{8,64})\/(abuse|confirm|hide|restore)$/.exec(path);
   if (!m) return json({ error: "Not found" }, 404);
   const id = m[1];
   const action = m[2];
@@ -1716,6 +1776,24 @@ async function handleReportAction(request, env, path) {
     "SELECT id, confirmations FROM user_reports WHERE id = ? AND expires_at > ?"
   ).bind(id, Date.now()).first();
   if (!exists) return json({ error: "Report not found" }, 404);
+
+  if (action === "hide" || action === "restore") {
+    if (!(env && env.OWNER_REPORT_KEY)) {
+      return json({ error: "Owner access is not configured on this Worker" }, 401);
+    }
+    if (!(await ownerKeyMatches(request, env))) {
+      return json({ error: "Wrong owner key" }, 403, { "Cache-Control": "no-store" });
+    }
+    if (action === "hide") {
+      await env.DISPATCH_KV.put("report_owner_hidden:" + id, "1", { expirationTtl: REPORT_OWNER_TTL_SEC });
+      return json({ ok: true, id, owner_hidden: true }, 200, { "Cache-Control": "no-store" });
+    }
+    await env.DISPATCH_KV.delete("report_owner_hidden:" + id);
+    await env.DISPATCH_KV.delete("report_hidden:" + id);
+    await env.DISPATCH_KV.delete("report_abuse:" + id);
+    return json({ ok: true, id, owner_hidden: false }, 200, { "Cache-Control": "no-store" });
+  }
+
   const caller = await reportClientKey(request);
   if (!caller) return json({ error: "Cannot identify caller" }, 400);
 
@@ -2076,7 +2154,7 @@ async function handleDiscover(env) {
 __name(handleDiscover, "handleDiscover");
 var STATIC_ASSETS = {
   "/icon.svg": { content: "\"<svg xmlns=\\\"http://www.w3.org/2000/svg\\\" width=\\\"512\\\" height=\\\"512\\\" viewBox=\\\"0 0 512 512\\\"><rect width=\\\"512\\\" height=\\\"512\\\" rx=\\\"80\\\" fill=\\\"#1a1a2e\\\"/><text x=\\\"256\\\" y=\\\"340\\\" font-size=\\\"280\\\" text-anchor=\\\"middle\\\" fill=\\\"#e94560\\\" font-family=\\\"sans-serif\\\" font-weight=\\\"bold\\\">S</text></svg>\"", contentType: "image/svg+xml" },
-  "/sw.js": { content: "const CACHE = 'sb-dispatch-v2';\nconst STATIC = ['/','/index.html','/css/dashboard.css','/js/app.js','/js/cards.js','/js/map.js','/js/deepdive.js','/js/app-data.js','/manifest.json'];\nself.addEventListener('install', e => { self.skipWaiting(); e.waitUntil(caches.open(CACHE).then(c => c.addAll(STATIC).catch(() => {}))); });\nself.addEventListener('activate', e => e.waitUntil(caches.keys().then(function(ks){return Promise.all(ks.filter(function(k){return k !== CACHE;}).map(function(k){return caches.delete(k);}));}).then(function(){return self.clients.claim();})));\nself.addEventListener('fetch', e => {\n  const url = new URL(e.request.url);\n  if (url.pathname.startsWith('/api/')) {\n    e.respondWith(fetch(e.request).then(r => { const c = r.clone(); caches.open(CACHE).then(c2 => c2.put(e.request, c)); return r; }).catch(() => caches.match(e.request)));\n  } else {\n    e.respondWith(caches.match(e.request).then(r => r || fetch(e.request).then(res => { const c = res.clone(); caches.open(CACHE).then(c2 => c2.put(e.request, c)); return res; }).catch(() => caches.match('/'))));\n  }\n});", contentType: "application/javascript" },
+  "/sw.js": { content: "const CACHE = 'sb-dispatch-v3';\nconst STATIC = ['/','/index.html','/css/dashboard.css','/js/app.js','/js/cards.js','/js/map.js','/js/deepdive.js','/js/app-data.js','/manifest.json'];\nself.addEventListener('install', e => { self.skipWaiting(); e.waitUntil(caches.open(CACHE).then(c => c.addAll(STATIC).catch(() => {}))); });\nself.addEventListener('activate', e => e.waitUntil(caches.keys().then(function(ks){return Promise.all(ks.filter(function(k){return k !== CACHE;}).map(function(k){return caches.delete(k);}));}).then(function(){return self.clients.claim();})));\nself.addEventListener('fetch', e => {\n  const url = new URL(e.request.url);\n  if (url.pathname.startsWith('/api/')) {\n    e.respondWith(fetch(e.request).then(r => { const c = r.clone(); caches.open(CACHE).then(c2 => c2.put(e.request, c)); return r; }).catch(() => caches.match(e.request)));\n  } else {\n    e.respondWith(caches.match(e.request).then(r => r || fetch(e.request).then(res => { const c = res.clone(); caches.open(CACHE).then(c2 => c2.put(e.request, c)); return res; }).catch(() => caches.match('/'))));\n  }\n});", contentType: "application/javascript" },
   "/manifest.json": { content: "{\"id\":\"/\",\"name\":\"SB County Dispatch\",\"short_name\":\"SB Dispatch\",\"description\":\"Real-time San Bernardino County dispatch calls\",\"start_url\":\"/\",\"display\":\"standalone\",\"background_color\":\"#1a1a2e\",\"theme_color\":\"#1a1a2e\",\"icons\":[{\"src\":\"/icon.svg\",\"sizes\":\"any\",\"type\":\"image/svg+xml\",\"purpose\":\"any\"},{\"src\":\"/icon.svg\",\"sizes\":\"512x512\",\"type\":\"image/svg+xml\",\"purpose\":\"maskable\"}],\"screenshots\":[{\"src\":\"/icon.svg\",\"sizes\":\"1280x720\",\"type\":\"image/svg+xml\",\"form_factor\":\"wide\",\"label\":\"SB County Dispatch Dashboard\"},{\"src\":\"/icon.svg\",\"sizes\":\"512x1024\",\"type\":\"image/svg+xml\",\"label\":\"SB County Dispatch Mobile\"}]}", contentType: "application/manifest+json" },
   "/js/app-data.js": { content: `export const APP_DATA = ${JSON.stringify(WEB_DATA)};
 `, type: "application/javascript" },
@@ -2143,6 +2221,14 @@ var STATIC_ASSETS = {
         <div id="time-scrubber" class="time-scrubber"><button class="ts-btn active" data-min="0">All</button><button class="ts-btn" data-min="15">15m</button><button class="ts-btn" data-min="60">1h</button><button class="ts-btn" data-min="360">6h</button><button class="ts-btn" data-min="1440">24h</button></div>
         
         <span id="card-count"></span>
+      </div>
+      <div id="report-list" class="report-list hidden">
+        <div class="rlist-head">
+          <span class="rlist-title">Community reports</span>
+          <span id="report-list-count" class="rlist-count"></span>
+          <button id="report-owner-btn" class="rlist-owner" type="button" onclick="window.toggleOwnerMode()" title="Owner moderation">&#128274;</button>
+        </div>
+        <div id="report-rows" class="rlist-rows"></div>
       </div>
       <div id="card-grid"></div>
     </div>
@@ -2350,6 +2436,26 @@ header {
 .report-legend .rl-buttons { display: flex; gap: 0.25rem; margin-top: 0.35rem; }
 .report-legend .rl-buttons button { background: var(--bg); border: 1px solid var(--border); color: var(--text-2); border-radius: 3px; font-family: var(--mono); font-size: 9px; padding: 0.15rem 0.32rem; cursor: pointer; }
 .report-legend .rl-buttons button.active { color: var(--text); border-color: #f59e0b; }
+.report-list { flex-shrink: 0; display: flex; flex-direction: column; border-bottom: 1px solid var(--border); background: var(--bg-card); max-height: 32vh; }
+.report-list.hidden { display: none; }
+.rlist-head { display: flex; align-items: center; gap: 0.4rem; padding: 0.35rem 0.75rem; font-family: var(--mono); font-size: 10px; color: var(--text-3); text-transform: uppercase; letter-spacing: 0.05em; }
+.rlist-title { color: var(--text-2); font-weight: 600; }
+.rlist-count { color: var(--text-3); }
+.rlist-owner { margin-left: auto; background: transparent; border: 1px solid transparent; border-radius: 3px; color: var(--text-3); font-size: 11px; line-height: 1; padding: 0.2rem 0.3rem; cursor: pointer; }
+.rlist-owner:hover { color: var(--text-2); border-color: var(--border); }
+.rlist-owner.active { color: #f59e0b; border-color: #f59e0b; }
+.rlist-rows { display: flex; flex-direction: column; gap: 2px; overflow-y: auto; padding: 0 0.5rem 0.4rem; }
+.rlist-row { display: flex; align-items: center; gap: 0.4rem; padding: 0.25rem 0.35rem; border: 1px solid transparent; border-radius: 4px; cursor: pointer; font-family: var(--mono); font-size: 11px; color: var(--text-2); }
+.rlist-row:hover { background: var(--bg-raised); border-color: var(--border); }
+.rlist-row.hidden-report { opacity: 0.55; }
+.rlist-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; background: #f59e0b; }
+.rlist-dot.confirmed { background: #22c55e; }
+.rlist-cat { color: var(--text); text-transform: capitalize; flex-shrink: 0; }
+.rlist-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rlist-meta { flex-shrink: 0; color: var(--text-3); font-size: 10px; }
+.rlist-meta.confirmed { color: #22c55e; }
+.rlist-act { flex-shrink: 0; background: var(--bg); border: 1px solid var(--border); border-radius: 3px; color: var(--text-2); font-family: var(--mono); font-size: 9px; padding: 0.1rem 0.3rem; cursor: pointer; }
+.rlist-act:hover { color: var(--text); border-color: var(--text-3); }
 
 .filter-scroll {
   display: flex;
@@ -3981,8 +4087,192 @@ export function renderReports(reports) {
       opacity: 0.95,
     }).addTo(reportGroup);
     m.bindPopup(buildReportPopup(r));
+    m.reportId = r.id;
+  }
+  renderReportList(lastReports);
+}
+
+const OWNER_KEY_STORAGE = 'sb-owner-key';
+let ownerMode = false;
+
+function ownerKey() {
+  try {
+    return localStorage.getItem(OWNER_KEY_STORAGE) || '';
+  } catch (e) {
+    return '';
   }
 }
+
+function forgetOwnerKey() {
+  ownerMode = false;
+  try { localStorage.removeItem(OWNER_KEY_STORAGE); } catch (e) {}
+}
+
+function reportCoords(r) {
+  const lat = Number(r.lat);
+  const lng = Number(r.lng);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return '';
+  return lat.toFixed(3) + ', ' + lng.toFixed(3);
+}
+
+/** Jump from a list row to the same pin the map draws. */
+export function focusReport(id) {
+  if (!map || !reportGroup) return;
+  const layers = reportGroup.getLayers();
+  for (let i = 0; i < layers.length; i++) {
+    if (layers[i].reportId === id) {
+      map.setView(layers[i].getLatLng(), 15, { animate: true });
+      layers[i].openPopup();
+      return;
+    }
+  }
+}
+
+function reportListRow(r) {
+  const id = reportIdArg(r);
+  const confirmed = !!r.county_match;
+  const row = document.createElement('div');
+  row.className = 'rlist-row' + ((r.owner_hidden || r.crowd_hidden) ? ' hidden-report' : '');
+  row.setAttribute('data-id', id);
+
+  const dot = document.createElement('span');
+  dot.className = 'rlist-dot' + (confirmed ? ' confirmed' : '');
+  row.appendChild(dot);
+
+  const cat = document.createElement('span');
+  cat.className = 'rlist-cat';
+  cat.textContent = r.category || 'other';
+  row.appendChild(cat);
+
+  const text = document.createElement('span');
+  text.className = 'rlist-text';
+  text.textContent = r.note ? r.note : reportCoords(r);
+  row.appendChild(text);
+
+  const bits = [timeAgo(new Date(r.created_at).toISOString())];
+  const confirms = Number(r.confirmations) || 0;
+  if (confirms) bits.push(confirms + (confirms === 1 ? ' confirm' : ' confirms'));
+  if (r.crowd_hidden) bits.push('hidden by flags');
+  else if (r.owner_hidden) bits.push('hidden by owner');
+  else if (confirmed) bits.push('CONFIRMED');
+  const meta = document.createElement('span');
+  meta.className = 'rlist-meta' + ((confirmed && !r.owner_hidden && !r.crowd_hidden) ? ' confirmed' : '');
+  meta.textContent = bits.join(' \u00b7 ');
+  row.appendChild(meta);
+
+  if (ownerMode) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'rlist-act';
+    btn.textContent = r.owner_hidden ? 'Restore' : 'Hide';
+    btn.addEventListener('click', function (e) {
+      e.stopPropagation();
+      if (r.owner_hidden) window.ownerRestoreReport(id);
+      else window.ownerHideReport(id);
+    });
+    row.appendChild(btn);
+  } else {
+    row.addEventListener('click', function () { focusReport(id); });
+  }
+  return row;
+}
+
+/** The list beside the dispatch cards, honouring the same report filter. */
+export function renderReportList(reports) {
+  const wrap = document.getElementById('report-list');
+  const host = document.getElementById('report-rows');
+  const countEl = document.getElementById('report-list-count');
+  const ownerBtn = document.getElementById('report-owner-btn');
+  if (!wrap || !host) return;
+  if (ownerBtn) ownerBtn.classList.toggle('active', ownerMode);
+
+  const localHidden = locallyHiddenReports();
+  let rows = (reports || []).filter(function (r) { return !localHidden.has(r.id); });
+  if (reportFilter === 'confirmed') rows = rows.filter(function (r) { return !!r.county_match; });
+  if (reportFilter === 'off') rows = [];
+
+  host.innerHTML = '';
+  if (!rows.length) {
+    wrap.classList.add('hidden');
+    if (countEl) countEl.textContent = '';
+    return;
+  }
+  wrap.classList.remove('hidden');
+  if (countEl) countEl.textContent = String(rows.length);
+  for (let i = 0; i < rows.length; i++) host.appendChild(reportListRow(rows[i]));
+}
+
+/** One report fetch for the map, the list and the owner view alike. */
+export async function refreshReportFeed() {
+  const key = ownerKey();
+  let resp;
+  try {
+    resp = await fetch('/api/reports', key ? { headers: { 'X-Owner-Key': key } } : undefined);
+  } catch (err) {
+    throw err;
+  }
+  if (!resp.ok) {
+    if (key && (resp.status === 401 || resp.status === 403)) forgetOwnerKey();
+    return null;
+  }
+  const data = await resp.json().catch(function () { return {}; });
+  if (key && data && data.owner) ownerMode = true;
+  if (data && data.reports) renderReports(data.reports);
+  return data;
+}
+
+window.refreshReports = refreshReportFeed;
+
+window.toggleOwnerMode = async function () {
+  if (ownerMode) {
+    forgetOwnerKey();
+    renderReportList(lastReports);
+    await refreshReportFeed();
+    return;
+  }
+  const entered = window.prompt('Owner key');
+  if (!entered) return;
+  try {
+    const resp = await fetch('/api/reports', { headers: { 'X-Owner-Key': entered } });
+    const data = await resp.json().catch(function () { return {}; });
+    if (!resp.ok || !data.owner) {
+      window.alert((data && data.error) || 'That key was not accepted');
+      return;
+    }
+    try { localStorage.setItem(OWNER_KEY_STORAGE, entered); } catch (e) {}
+    ownerMode = true;
+    renderReportList(data.reports || []);
+    await refreshReportFeed();
+  } catch (err) {
+    window.alert('Could not check the key: ' + err.message);
+  }
+};
+
+async function ownerAction(id, action) {
+  const key = ownerKey();
+  if (!key) {
+    window.alert('Enter the owner key first');
+    return;
+  }
+  try {
+    const resp = await fetch('/api/reports/' + encodeURIComponent(id) + '/' + action, {
+      method: 'POST',
+      headers: { 'X-Owner-Key': key }
+    });
+    const data = await resp.json().catch(function () { return {}; });
+    if (!resp.ok) {
+      if (resp.status === 401 || resp.status === 403) forgetOwnerKey();
+      window.alert((data && data.error) || ('Owner action failed (' + resp.status + ')'));
+      return;
+    }
+    await refreshReportFeed();
+  } catch (err) {
+    window.alert('Owner action failed: ' + err.message);
+  }
+}
+
+window.ownerHideReport = function (id) { return ownerAction(id, 'hide'); };
+window.ownerRestoreReport = function (id) { return ownerAction(id, 'restore'); };
 
 let reportPreview = null;
 let reportPickHandler = null;
@@ -4864,7 +5154,7 @@ export function showDeepDive(record) {
 
 window.showDeepDive = showDeepDive;
 `, type: "application/javascript" },
-  "/js/app.js": { content: `import { initMap, updateMap, filterByAgency, filterByExclude, filterNearby, setMapUserLocation, removeMapUserLocation, applySearchFilter, unpinMapView, initReportLayer, initReportLegend, renderReports, currentMapCenter, setReportPreview, clearReportPreview, startReportPick, stopReportPick } from './map.js';
+  "/js/app.js": { content: `import { initMap, updateMap, filterByAgency, filterByExclude, filterNearby, setMapUserLocation, removeMapUserLocation, applySearchFilter, unpinMapView, initReportLayer, initReportLegend, refreshReportFeed, currentMapCenter, setReportPreview, clearReportPreview, startReportPick, stopReportPick } from './map.js';
 import { updateCards, filterCards, highlightCard, setSort, setGroup, setCategory, setBookmarkMode, renderSkeletons } from './cards.js';
 window.toggleBookmarkMode = function() { var btn = document.getElementById('btn-bookmarks'); var active = btn.classList.toggle('active'); setBookmarkMode(active); btn.textContent = active ? '\u2605' : '\u2606'; };
 import { showDeepDive } from './deepdive.js';
@@ -4889,10 +5179,7 @@ var reportAccuracyM = null;
 
 async function loadReports() {
   try {
-    var resp = await fetch('/api/reports');
-    if (!resp.ok) return;
-    var data = await resp.json();
-    if (data && data.reports) renderReports(data.reports);
+    await refreshReportFeed();
   } catch (err) {
     console.error('Reports failed:', err);
   }

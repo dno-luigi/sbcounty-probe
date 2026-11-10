@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { cleanReportNote, isReportCategory, isReportInBBox, distanceMiles, parseDispatchTime, findCountyMatch } from "../worker.js";
+import { cleanReportNote, isReportCategory, isReportInBBox, distanceMiles, parseDispatchTime, findCountyMatch, secretEqual, ownerKeyMatches, isReportPubliclyVisible } from "../worker.js";
 
 test("only the known report categories are accepted", () => {
   for (const c of ["police", "fire", "medical", "traffic", "other"]) {
@@ -67,4 +67,30 @@ test("far away or out of window calls do not confirm a report", () => {
   assert.equal(findCountyMatch(report, [far]), null);
   assert.equal(findCountyMatch(report, [late]), null);
   assert.equal(findCountyMatch(report, []), null);
+});
+
+test("owner keys are compared without an early exit and never match nothing", async () => {
+  assert.equal(await secretEqual("abc", "abc"), true);
+  assert.equal(await secretEqual("abc", "abd"), false);
+  assert.equal(await secretEqual("abc", "abcd"), false);
+  assert.equal(await secretEqual("", "abc"), false);
+  assert.equal(await secretEqual(null, null), false);
+  assert.equal(await secretEqual("a".repeat(5000), "a".repeat(5000)), true);
+});
+
+test("owner access fails closed when the secret is not configured", async () => {
+  const req = (headers) => ({ headers: { get: (name) => headers[name.toLowerCase()] ?? null } });
+  assert.equal(await ownerKeyMatches(req({ "x-owner-key": "k" }), {}), false);
+  assert.equal(await ownerKeyMatches(req({ "x-owner-key": "k" }), { OWNER_REPORT_KEY: "" }), false);
+  assert.equal(await ownerKeyMatches(req({}), { OWNER_REPORT_KEY: "k" }), false);
+  assert.equal(await ownerKeyMatches(req({ "x-owner-key": "nope" }), { OWNER_REPORT_KEY: "k" }), false);
+  assert.equal(await ownerKeyMatches(req({ "x-owner-key": "k" }), { OWNER_REPORT_KEY: "k" }), true);
+});
+
+test("a report is public until the crowd or the owner hides it", () => {
+  const crowd = new Set(["a"]);
+  const owner = new Set(["b"]);
+  assert.equal(isReportPubliclyVisible("c", crowd, owner), true);
+  assert.equal(isReportPubliclyVisible("a", crowd, owner), false);
+  assert.equal(isReportPubliclyVisible("b", crowd, owner), false);
 });
