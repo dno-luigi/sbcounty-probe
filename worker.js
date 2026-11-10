@@ -1587,6 +1587,37 @@ function countReportingAgencies(scrapeResults, configured = ALL_AGENCY_CODES) {
 __name(countReportingAgencies, "countReportingAgencies");
 
 /**
+ * How long a run may be in flight before a later tick treats it as dead.
+ *
+ * A healthy run measures 165-185s. The old design wrote a ten-minute reservation
+ * into `meta:next_scrape_at` when a run began, so a run that was killed mid-flight
+ * (isolate eviction, a deploy, an unexplained hang) left every tick skipping until
+ * that reservation expired: the pipeline sat idle for ten minutes with no way to
+ * tell "a run is working" from "a run died and left its receipt".
+ */
+const RUN_STALE_MS = 5 * 60 * 1e3;
+const RUN_LOCK_KEY = "meta:run_lock";
+
+/**
+ * Whether this tick should start a scrape.
+ *
+ * Pacing (`next_scrape_at`) and "a run is in flight" are separate facts and are
+ * stored separately now, because one key carrying both meant an expired
+ * reservation was indistinguishable from a scheduled pause.
+ */
+function shouldStartScrape(now, nextScrapeAt, lock, staleMs = RUN_STALE_MS) {
+  const startedAt = lock && typeof lock.started_at === "number" ? lock.started_at : null;
+  const finished = Boolean(lock && lock.finished_at);
+  if (startedAt !== null && !finished) {
+    if (now - startedAt < staleMs) return { start: false, reason: "running" };
+    return { start: true, reason: "reclaimed" };
+  }
+  if (nextScrapeAt && now < nextScrapeAt) return { start: false, reason: "scheduled" };
+  return { start: true, reason: "due" };
+}
+__name(shouldStartScrape, "shouldStartScrape");
+
+/**
  * When the next run should start, measured from when this one finished.
  *
  * Scheduling from the start time (now + interval) meant that a run lasting longer
@@ -6313,9 +6344,18 @@ var index_default = {
     ctx.waitUntil((async () => {
       const now = Date.now();
       const nextScrapeAt = await env.DISPATCH_KV.get("meta:next_scrape_at", "json");
-      if (nextScrapeAt && now < nextScrapeAt) {
-        console.log(`Skipping: next scrape at ${new Date(nextScrapeAt).toISOString()} (${Math.round((nextScrapeAt - now) / 1e3)}s away)`);
+      const runLock = await env.DISPATCH_KV.get(RUN_LOCK_KEY, "json");
+      const decision = shouldStartScrape(now, nextScrapeAt, runLock);
+      if (!decision.start) {
+        if (decision.reason === "running") {
+          console.log(`Skipping: a run started ${Math.round((now - runLock.started_at) / 1e3)}s ago is still in flight`);
+        } else {
+          console.log(`Skipping: next scrape at ${new Date(nextScrapeAt).toISOString()} (${Math.round((nextScrapeAt - now) / 1e3)}s away)`);
+        }
         return;
+      }
+      if (decision.reason === "reclaimed") {
+        console.warn(`Reclaiming a run lock from ${Math.round((now - runLock.started_at) / 1e3)}s ago: that run never finished`);
       }
       const rateLimitedAt = await env.DISPATCH_KV.get("meta:rate_limited", "json");
       if (rateLimitedAt && now - rateLimitedAt < 5 * 60 * 1e3) {
@@ -6323,8 +6363,7 @@ var index_default = {
         await env.DISPATCH_KV.put("meta:next_scrape_at", JSON.stringify(now + 5 * 60 * 1e3));
         return;
       }
-      const lockAt = now + 10 * 60 * 1e3;
-      await env.DISPATCH_KV.put("meta:next_scrape_at", JSON.stringify(lockAt));
+      await env.DISPATCH_KV.put(RUN_LOCK_KEY, JSON.stringify({ started_at: now }));
       const startTime = Date.now();
       try {
         const scrapeResults = await runScraper(env);
@@ -6388,7 +6427,8 @@ var index_default = {
           env.DISPATCH_KV.put("meta:last_run", JSON.stringify(result)),
           env.DISPATCH_KV.put("meta:last_scrape_at", JSON.stringify(now)),
           env.DISPATCH_KV.put("meta:next_scrape_at", JSON.stringify(nextAt)),
-          env.DISPATCH_KV.put("meta:last_scrape_row_count", JSON.stringify(storageResults.total))
+          env.DISPATCH_KV.put("meta:last_scrape_row_count", JSON.stringify(storageResults.total)),
+          env.DISPATCH_KV.put(RUN_LOCK_KEY, JSON.stringify({ started_at: now, finished_at: Date.now() }))
         ]);
         console.log(`Cron [${mode}] ${result.stored} new, ${result.skipped} dups` + (geoStats ? `, geo ${geoStats.updated}/${geoStats.pairs} (${geoStats.deferred} deferred)` : "") + `, next in ${result.interval_min}m`);
       } catch (err) {
@@ -6403,7 +6443,8 @@ var index_default = {
             error: err.message,
             duration_ms: Date.now() - startTime
           })),
-          env.DISPATCH_KV.put("meta:next_scrape_at", JSON.stringify(nextAt))
+          env.DISPATCH_KV.put("meta:next_scrape_at", JSON.stringify(nextAt)),
+          env.DISPATCH_KV.put(RUN_LOCK_KEY, JSON.stringify({ started_at: now, finished_at: Date.now() }))
         ]);
       }
     })());
@@ -6414,6 +6455,8 @@ export {
   countReportingAgencies,
   computeNextScrapeAt,
   computeSlowInterval,
+  shouldStartScrape,
+  RUN_STALE_MS,
   isReportCategory,
   isReportInBBox,
   cleanReportNote,

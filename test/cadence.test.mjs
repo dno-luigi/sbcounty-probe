@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { computeNextScrapeAt, computeSlowInterval } from "../worker.js";
+import { computeNextScrapeAt, computeSlowInterval, shouldStartScrape, RUN_STALE_MS } from "../worker.js";
 
 const FAST = 3 * 60_000;
 const CAP = 15 * 60_000;
@@ -48,4 +48,44 @@ test("the quiet interval is never faster than fast mode, nor slower than the cap
     assert.ok(ms >= FAST, `${ms}ms is below the fast interval for prev=${prev}`);
     assert.ok(ms <= CAP, `${ms}ms exceeds the cap for prev=${prev}`);
   }
+});
+
+// The ten-minute reservation used to live in next_scrape_at, so a run that died
+// mid-flight blocked every tick until it expired. A stale in-flight marker is now
+// reclaimed on the next tick instead.
+
+test("a run in flight keeps the next tick off, even when a scrape is due", () => {
+  const now = 1_000_000;
+  const decision = shouldStartScrape(now, now - 60_000, { started_at: now - 10_000 });
+  assert.equal(decision.start, false);
+  assert.equal(decision.reason, "running");
+});
+
+test("a run that outlives the staleness bound is reclaimed", () => {
+  const now = 1_000_000;
+  for (const age of [RUN_STALE_MS, RUN_STALE_MS + 1, 10 * 60_000]) {
+    const decision = shouldStartScrape(now, now - 60_000, { started_at: now - age });
+    assert.equal(decision.start, true, `${age}ms old should be reclaimed`);
+    assert.equal(decision.reason, "reclaimed");
+  }
+});
+
+test("a finished run puts pacing back in charge", () => {
+  const now = 1_000_000;
+  const lock = { started_at: now - 400_000, finished_at: now - 200_000 };
+  assert.equal(shouldStartScrape(now, now + 120_000, lock).reason, "scheduled");
+  assert.equal(shouldStartScrape(now, now - 1, lock).reason, "due");
+});
+
+test("a scheduled pause is not mistaken for a dead run", () => {
+  const now = 1_000_000;
+  assert.deepEqual(shouldStartScrape(now, now + 60_000, null), {
+    start: false,
+    reason: "scheduled"
+  });
+});
+
+test("no markers at all means a scrape is due", () => {
+  assert.deepEqual(shouldStartScrape(1_000_000, null, null), { start: true, reason: "due" });
+  assert.deepEqual(shouldStartScrape(1_000_000, 0, null), { start: true, reason: "due" });
 });

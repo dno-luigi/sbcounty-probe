@@ -198,3 +198,39 @@ Dispatch search already covered street names and incident types: `filterCards()`
 - Ten tiles, ten features each, measured once across the county: Victorville 8 dispatch-like of 10, San Bernardino 7, Needles 7, Fontana/Rancho 6, Redlands 6, Hesperia/Apple Valley 6, Ontario 5, Barstow 2, Twentynine Palms 2, Big Bear 1. Nothing was dead, so no tile was deleted.
 - Instead each tile keeps a decaying hit score in KV (`citizen_tile_stats`, one read and one write per poll rather than one per tile). Five of the six slots go to the highest scores and the sixth always goes to the least recently polled tile, because every score starts at zero and a cold start would otherwise pin the same six tiles forever (measured once: Needles, with 7 usable features, was the tenth in the list and got no slot at all). a tile with six consecutive empty polls is only probed every fourth poll, so a quiet corner costs one request in four instead of every time and can still recover.
 - `citizen_rows` and `citizen_errors` now appear in `last_run` from both the cron path and `/api/scrape`, so a run that carried the source is visible without reading D1.
+
+## 2026-11-10 - a dead run no longer freezes the schedule
+
+`meta:next_scrape_at` carried two facts at once: when the next run is due, and a
+ten-minute reservation taken when a run starts. A run killed mid-flight left the
+reservation behind, and every tick until it expired logged `Skipping: next scrape at ...
+(180s away)` and did nothing. Observed live: a run began at 04:17:38, never wrote
+`last_run`, and the pipeline sat idle until the reservation lapsed at 04:27:38 — sixteen
+minutes between completed runs, with `last_run` still describing the run before it.
+
+Pacing and "in flight" are separate keys now. `meta:run_lock` holds `{started_at}` while
+a run is working, and `{started_at, finished_at}` once it returns, written on both the
+success and the failure path so a thrown run cannot block its own retry.
+`shouldStartScrape()` decides each tick:
+
+- a marker without `finished_at` that is younger than `RUN_STALE_MS` (5 min, against a
+  165-185 s run) — skip, a run is working;
+- a marker older than that — start anyway and log `Reclaiming a run lock from Ns ago`,
+  because no healthy run reaches five minutes;
+- otherwise pacing decides, exactly as before.
+
+The fast/slow ramp, `computeNextScrapeAt()` from the finish, and the rule about naming a
+helper `nextScrapeAt` are untouched. `POST /api/scrape` still bypasses pacing and still
+takes no marker, so a manual trigger can overlap a cron run as it always could — that is
+what drove durations from 188 s to 217 s while this stall was being investigated.
+
+Tests: 35. Five new ones in `test/cadence.test.mjs` cover the in-flight skip, the reclaim
+at and past the bound, a finished marker handing control back to pacing, a scheduled pause
+that must not be mistaken for a dead run, and the cold case with no markers at all.
+
+Deployed as version `652210f2` at 05:07:48Z and verified on one live run: the marker was
+written at 05:08:38 (`{"started_at":1794287318353}`, no `finished_at`), three ticks logged
+`Skipping: a run started 60s/120s/180s ago is still in flight` instead of the old pacing
+message, the run finished at 05:11:54 with `stored: 47`, and the marker was then cleared
+(`finished_at` present, 196 s long). A tick that finds the marker older than five minutes
+has not been observed in the wild yet; the unit tests pin that path.

@@ -72,7 +72,7 @@ These look like bugs when met cold. Do not "fix" them.
 
 ```bash
 node --check worker.js
-node --test test/                       # 30 tests
+node --test test/                       # 35 tests
 npx wrangler deploy --dry-run           # config and bundle, deploys nothing
 curl -s https://watcher.ai-n.org/api/health
 ```
