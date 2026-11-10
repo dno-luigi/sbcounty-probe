@@ -1048,14 +1048,29 @@ async function scrapeCitizen(env) {
   const pollIndex = Math.floor(now / CITIZEN_POLL_GAP_MS);
   const ranked = CITIZEN_TILES.map((tile) => {
     const entry = stats[tile.x + "/" + tile.y] || {};
-    return { tile, score: Number(entry.score) || 0, empty: Number(entry.empty) || 0 };
+    return {
+      tile,
+      score: Number(entry.score) || 0,
+      empty: Number(entry.empty) || 0,
+      last: Number(entry.last) || 0
+    };
   }).sort((a, b) => b.score - a.score);
+  // Five slots go to the best-scoring tiles. The sixth always goes to whichever
+  // tile was polled longest ago, because every score starts at zero: without that
+  // slot a tile nobody has sampled yet can never earn its way in, and a cold start
+  // would pin the same six forever.
   const batch = [];
+  const slotCap = Math.max(1, CITIZEN_MAX_TILES - 1);
   for (const item of ranked) {
-    if (batch.length >= CITIZEN_MAX_TILES) break;
+    if (batch.length >= slotCap) break;
     if (item.empty >= CITIZEN_TILE_PROBE_AFTER && pollIndex % 4 !== 0) continue;
     batch.push(item.tile);
   }
+  const chosen = new Set(batch.map((t) => t.x + "/" + t.y));
+  const unpolled = ranked
+    .filter((item) => !chosen.has(item.tile.x + "/" + item.tile.y))
+    .sort((a, b) => a.last - b.last);
+  if (unpolled.length && batch.length < CITIZEN_MAX_TILES) batch.push(unpolled[0].tile);
 
   const startedAt = Date.now();
   const seen = new Set();
@@ -1093,7 +1108,8 @@ async function scrapeCitizen(env) {
       stats[tileKey] = {
         score: Math.round(((Number(prev.score) || 0) * 0.7 + (keptHere > 0 ? 1 : 0)) * 1e3) / 1e3,
         empty: keptHere > 0 ? 0 : (Number(prev.empty) || 0) + 1,
-        kept: keptHere
+        kept: keptHere,
+        last: now
       };
     } catch (err) {
       errors.push({ tile: tile.x + "/" + tile.y + "/" + tile.z, error: err.message });
