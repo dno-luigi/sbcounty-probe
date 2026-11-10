@@ -833,6 +833,9 @@ var CITIZEN_TILES = [
 var CITIZEN_MAX_TILES = 7;
 var CITIZEN_MAX_DETAILS = 5;
 var CITIZEN_POLL_GAP_MS = 6 * 60 * 1e3;
+var CITIZEN_TIMEOUT_MS = 5e3;
+var CITIZEN_BUDGET_MS = 20e3;
+var CITIZEN_COOLDOWN_MS = 60 * 60 * 1e3;
 var CITIZEN_TYPES = {
   "CIT-FIRE": { desc: "Citizen: Fire/EMS", category: "Fire", severity: "high" },
   "CIT-MED": { desc: "Citizen: Medical", category: "Medical", severity: "high" },
@@ -1004,7 +1007,7 @@ function citizenRow(detail, code) {
 async function citizenFetchJson(url) {
   const resp = await fetch(url, {
     headers: { Accept: "application/json", "User-Agent": CITIZEN_UA },
-    signal: AbortSignal.timeout(12e3)
+    signal: AbortSignal.timeout(CITIZEN_TIMEOUT_MS)
   });
   if (!resp.ok) return null;
   const data = await resp.json();
@@ -1018,6 +1021,11 @@ async function scrapeCitizen(env) {
   const results = [];
   const errors = [];
   const now = Date.now();
+  try {
+    if (await env.DISPATCH_KV.get("citizen:cooldown")) {
+      return { results, errors, cooled: true };
+    }
+  } catch (e) {}
   let lastPoll = null;
   try { lastPoll = Number(await env.DISPATCH_KV.get("citizen:last_poll")); } catch (e) {}
   if (Number.isFinite(lastPoll) && lastPoll > 0 && now - lastPoll < CITIZEN_POLL_GAP_MS) {
@@ -1032,15 +1040,20 @@ async function scrapeCitizen(env) {
   const take = Math.min(CITIZEN_MAX_TILES, CITIZEN_TILES.length);
   for (let i = 0; i < take; i++) batch.push(CITIZEN_TILES[(offset + i) % CITIZEN_TILES.length]);
 
+  const startedAt = Date.now();
   const seen = new Set();
   const candidates = [];
   for (const tile of batch) {
+    if (Date.now() - startedAt > CITIZEN_BUDGET_MS) {
+      errors.push({ budget: "tile phase exceeded " + CITIZEN_BUDGET_MS + "ms" });
+      break;
+    }
     try {
       const resp = await fetch(
         CITIZEN_API + "/v1/tile/incidents/" + tile.x + "/" + tile.y + "/" + tile.z + ".pbf",
         {
           headers: { Accept: "application/x-protobuf", "User-Agent": CITIZEN_UA },
-          signal: AbortSignal.timeout(12e3)
+          signal: AbortSignal.timeout(CITIZEN_TIMEOUT_MS)
         }
       );
       if (!resp.ok) {
@@ -1064,6 +1077,10 @@ async function scrapeCitizen(env) {
   let hydrated = 0;
   for (const item of candidates) {
     if (hydrated >= CITIZEN_MAX_DETAILS) break;
+    if (Date.now() - startedAt > CITIZEN_BUDGET_MS) {
+      errors.push({ budget: "detail phase exceeded " + CITIZEN_BUDGET_MS + "ms" });
+      break;
+    }
     try {
       if (await env.DISPATCH_KV.get("citizen_seen:" + item.id)) continue;
     } catch (e) {}
@@ -1085,7 +1102,14 @@ async function scrapeCitizen(env) {
       errors.push({ id: item.id, error: err.message });
     }
   }
-  return { results, errors, candidates: candidates.length, hydrated };
+  if (results.length > 0) {
+    try { await env.DISPATCH_KV.delete("citizen:cooldown"); } catch (e) {}
+  } else if (errors.length > 0) {
+    try {
+      await env.DISPATCH_KV.put("citizen:cooldown", "1", { expirationTtl: CITIZEN_COOLDOWN_MS / 1e3 });
+    } catch (e) {}
+  }
+  return { results, errors, candidates: candidates.length, hydrated, elapsed_ms: Date.now() - startedAt };
 }
 __name(scrapeCitizen, "scrapeCitizen");
 async function runScraper(env) {
