@@ -836,6 +836,8 @@ var CITIZEN_POLL_GAP_MS = 6 * 60 * 1e3;
 var CITIZEN_TIMEOUT_MS = 4e3;
 var CITIZEN_BUDGET_MS = 12e3;
 var CITIZEN_COOLDOWN_MS = 60 * 60 * 1e3;
+var CITIZEN_TILE_PROBE_AFTER = 6;
+var CITIZEN_TILE_STATS_KEY = "citizen_tile_stats";
 var CITIZEN_TYPES = {
   "CIT-FIRE": { desc: "Citizen: Fire/EMS", category: "Fire", severity: "high" },
   "CIT-MED": { desc: "Citizen: Medical", category: "Medical", severity: "high" },
@@ -1033,12 +1035,27 @@ async function scrapeCitizen(env) {
   }
   try { await env.DISPATCH_KV.put("citizen:last_poll", String(now), { expirationTtl: 3600 }); } catch (e) {}
 
-  // Rotate which tiles are polled so the far corners of the county get covered
-  // without asking for all of them on every run.
-  const offset = Math.floor(now / CITIZEN_POLL_GAP_MS) % CITIZEN_TILES.length;
+  // Spend the tile budget where incidents actually appear. Every tile keeps a
+  // decaying hit score: the best ones are polled every time, and a tile that has
+  // gone quiet is still probed every fourth poll so it can come back. Measured
+  // 2026-11-10 across all ten tiles: Victorville 8 dispatch-like features of 10,
+  // San Bernardino 7, Needles 7, Fontana 6, Redlands 6, Hesperia 6, Ontario 5,
+  // Barstow 2, Twentynine Palms 2, Big Bear 1 - nothing dead, so nothing is
+  // deleted, only de-prioritised.
+  let tileStats = null;
+  try { tileStats = await env.DISPATCH_KV.get(CITIZEN_TILE_STATS_KEY, "json"); } catch (e) {}
+  const stats = tileStats && typeof tileStats === "object" ? tileStats : {};
+  const pollIndex = Math.floor(now / CITIZEN_POLL_GAP_MS);
+  const ranked = CITIZEN_TILES.map((tile) => {
+    const entry = stats[tile.x + "/" + tile.y] || {};
+    return { tile, score: Number(entry.score) || 0, empty: Number(entry.empty) || 0 };
+  }).sort((a, b) => b.score - a.score);
   const batch = [];
-  const take = Math.min(CITIZEN_MAX_TILES, CITIZEN_TILES.length);
-  for (let i = 0; i < take; i++) batch.push(CITIZEN_TILES[(offset + i) % CITIZEN_TILES.length]);
+  for (const item of ranked) {
+    if (batch.length >= CITIZEN_MAX_TILES) break;
+    if (item.empty >= CITIZEN_TILE_PROBE_AFTER && pollIndex % 4 !== 0) continue;
+    batch.push(item.tile);
+  }
 
   const startedAt = Date.now();
   const seen = new Set();
@@ -1061,6 +1078,7 @@ async function scrapeCitizen(env) {
         continue;
       }
       const parsed = readCitizenTile(new Uint8Array(await resp.arrayBuffer()));
+      let keptHere = 0;
       for (const props of parsed) {
         const id = String(props.incident_id || "");
         if (!id || seen.has(id)) continue;
@@ -1068,7 +1086,15 @@ async function scrapeCitizen(env) {
         const code = citizenCallType(props.category);
         if (!code) continue;
         candidates.push({ id, code });
+        keptHere++;
       }
+      const tileKey = tile.x + "/" + tile.y;
+      const prev = stats[tileKey] || {};
+      stats[tileKey] = {
+        score: Math.round(((Number(prev.score) || 0) * 0.7 + (keptHere > 0 ? 1 : 0)) * 1e3) / 1e3,
+        empty: keptHere > 0 ? 0 : (Number(prev.empty) || 0) + 1,
+        kept: keptHere
+      };
     } catch (err) {
       errors.push({ tile: tile.x + "/" + tile.y + "/" + tile.z, error: err.message });
     }
@@ -1102,6 +1128,9 @@ async function scrapeCitizen(env) {
       errors.push({ id: item.id, error: err.message });
     }
   }
+  try {
+    await env.DISPATCH_KV.put(CITIZEN_TILE_STATS_KEY, JSON.stringify(stats), { expirationTtl: 30 * 86400 });
+  } catch (e) {}
   if (results.length > 0) {
     try { await env.DISPATCH_KV.delete("citizen:cooldown"); } catch (e) {}
   } else if (errors.length > 0) {
@@ -1335,6 +1364,8 @@ async function processScrapeResults(env, scrapeResults) {
     total: allRecords.length,
     agencies: Object.keys(scrapeResults.aspNet).length,
     rc_rows: scrapeResults.stats.rc_rows || 0,
+    citizen_rows: scrapeResults.stats.citizen_rows || 0,
+    citizen_errors: scrapeResults.stats.citizen_errors || 0,
     duration_ms: Date.now() - startTime
   }));
   return { stored, skipped, total: allRecords.length, duration_ms: Date.now() - startTime, pending_geo: pendingGeo };
@@ -6327,6 +6358,8 @@ var index_default = {
           total: storageResults.total,
           agencies: scrapeResults.stats.agencies_scraped,
           rc_rows: scrapeResults.stats.rc_rows,
+          citizen_rows: scrapeResults.stats.citizen_rows || 0,
+          citizen_errors: scrapeResults.stats.citizen_errors || 0,
           geo: geoStats,
           freshness: chpFreshness,
           purged: purgeResults.purged,

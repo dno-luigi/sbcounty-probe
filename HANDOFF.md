@@ -192,3 +192,9 @@ Dispatch search already covered street names and incident types: `filterCards()`
 - **Politeness.** The poll runs at most every 6 minutes (`citizen:last_poll`), takes a rotating slice of 7 of the 10 z11 tiles, hydrates at most 5 new incidents per poll, spaces detail requests 1.2 s apart, and treats every failure as a per-tile error rather than a run failure. Measured: the first run that carried it took 224 s against a 168 s baseline, so the limits were tightened to 6 tiles, 4 s per request and a 12 s total budget. Even at the cap this adds well under a minute, and pacing is measured from the finish, so runs still cannot overlap.
 - **Unofficial.** The endpoint family is undocumented and has changed before (`/api/incident/trending` now returns `410 gone`). If it dies, the layer empties and the county feeds are unaffected. Citizen sells the same data through a paid Enterprise API; the terms question remains the owner's.
 - Tests: `test/citizen.test.mjs` covers the tile reader (including a numeric attribute) and the category allow-list. Suite is 30.
+
+## 2026-11-10 - the Citizen poll follows measured yield
+
+- Ten tiles, ten features each, measured once across the county: Victorville 8 dispatch-like of 10, San Bernardino 7, Needles 7, Fontana/Rancho 6, Redlands 6, Hesperia/Apple Valley 6, Ontario 5, Barstow 2, Twentynine Palms 2, Big Bear 1. Nothing was dead, so no tile was deleted.
+- Instead each tile keeps a decaying hit score in KV (`citizen_tile_stats`, one read and one write per poll rather than one per tile). The top six by score are polled each time; a tile with six consecutive empty polls is only probed every fourth poll, so a quiet corner costs one request in four instead of every time and can still recover.
+- `citizen_rows` and `citizen_errors` now appear in `last_run` from both the cron path and `/api/scrape`, so a run that carried the source is visible without reading D1.
