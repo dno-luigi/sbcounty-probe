@@ -1070,7 +1070,10 @@ async function scrapeCitizen(env) {
   const unpolled = ranked
     .filter((item) => !chosen.has(item.tile.x + "/" + item.tile.y))
     .sort((a, b) => a.last - b.last);
-  if (unpolled.length && batch.length < CITIZEN_MAX_TILES) batch.push(unpolled[0].tile);
+  // Front of the batch, not the back: the tile phase stops when the time budget
+  // runs out, and a starved tile appended last is exactly the one that gets
+  // trimmed every single poll - which is how it stayed starved in the first place.
+  if (unpolled.length && batch.length < CITIZEN_MAX_TILES) batch.unshift(unpolled[0].tile);
 
   const startedAt = Date.now();
   const seen = new Set();
