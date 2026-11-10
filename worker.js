@@ -830,11 +830,11 @@ var CITIZEN_TILES = [
   { x: 363, y: 817, z: 11 },
   { x: 371, y: 812, z: 11 }
 ];
-var CITIZEN_MAX_TILES = 7;
+var CITIZEN_MAX_TILES = 6;
 var CITIZEN_MAX_DETAILS = 5;
 var CITIZEN_POLL_GAP_MS = 6 * 60 * 1e3;
-var CITIZEN_TIMEOUT_MS = 5e3;
-var CITIZEN_BUDGET_MS = 20e3;
+var CITIZEN_TIMEOUT_MS = 4e3;
+var CITIZEN_BUDGET_MS = 12e3;
 var CITIZEN_COOLDOWN_MS = 60 * 60 * 1e3;
 var CITIZEN_TYPES = {
   "CIT-FIRE": { desc: "Citizen: Fire/EMS", category: "Fire", severity: "high" },
