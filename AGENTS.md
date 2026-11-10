@@ -72,7 +72,7 @@ These look like bugs when met cold. Do not "fix" them.
 
 ```bash
 node --check worker.js
-node --test test/                       # 27 tests
+node --test test/                       # 30 tests
 npx wrangler deploy --dry-run           # config and bundle, deploys nothing
 curl -s https://watcher.ai-n.org/api/health
 ```
@@ -101,3 +101,4 @@ will report the old values.
 | `test/health.test.mjs` | the reporting count rule behind `/api/health` |
 | `test/cadence.test.mjs` | the next-run scheduling rule |
 | `test/reports.test.mjs` | the report rules: categories, county box, note cleaning, county match, owner key |
+| `test/citizen.test.mjs` | the Citizen source: vector-tile reading and the category allow-list |

@@ -261,6 +261,7 @@ var RC_DISPOSITIONS = {
   "NO REPORT REQ": { desc: "No Report Required", meaning: "Call handled without a formal report" }
 };
 var AGENCY_NAMES = {
+  CITIZEN: "Citizen App",
   AD: "Adelanto City",
   AL: "Arrow Line",
   AP: "Apple Valley City",
@@ -319,6 +320,7 @@ var AGENCY_NAMES = {
   "RC-Y": "Coachella Valley"
 };
 var AGENCY_COLORS = {
+  CITIZEN: "#c026d3",
   AP: "#22c55e",
   VC: "#3b82f6",
   HE: "#f97316",
@@ -803,27 +805,323 @@ async function scrapeRiversideCounty(env) {
   return { results, errors };
 }
 __name(scrapeRiversideCounty, "scrapeRiversideCounty");
+
+// ---------------------------------------------------------------------------
+// Citizen (unofficial public API on data.sp0n.io)
+//
+// This is a second, clearly separate source. It never joins ALL_AGENCY_CODES,
+// so the 34-agency health number keeps meaning the county feeds. Discovery is
+// Mapbox vector tiles over a rotating slice of the county; each new incident is
+// hydrated once and remembered in KV so repeat polls cost nothing. Categories
+// that are not dispatch work (missing pets, power outages, community posts) are
+// dropped before any detail request is made.
+// ---------------------------------------------------------------------------
+var CITIZEN_API = "https://data.sp0n.io";
+var CITIZEN_UA = "SBCountyDispatchWatcher/1.0 (unofficial citizen reader)";
+var CITIZEN_TILES = [
+  { x: 356, y: 817, z: 11 },
+  { x: 355, y: 817, z: 11 },
+  { x: 354, y: 817, z: 11 },
+  { x: 357, y: 817, z: 11 },
+  { x: 356, y: 815, z: 11 },
+  { x: 356, y: 814, z: 11 },
+  { x: 358, y: 816, z: 11 },
+  { x: 358, y: 811, z: 11 },
+  { x: 363, y: 817, z: 11 },
+  { x: 371, y: 812, z: 11 }
+];
+var CITIZEN_MAX_TILES = 7;
+var CITIZEN_MAX_DETAILS = 5;
+var CITIZEN_POLL_GAP_MS = 6 * 60 * 1e3;
+var CITIZEN_TYPES = {
+  "CIT-FIRE": { desc: "Citizen: Fire/EMS", category: "Fire", severity: "high" },
+  "CIT-MED": { desc: "Citizen: Medical", category: "Medical", severity: "high" },
+  "CIT-TRAFFIC": { desc: "Citizen: Traffic", category: "Traffic", severity: "medium" },
+  "CIT-POLICE": { desc: "Citizen: Police", category: "Police", severity: "medium" }
+};
+var CITIZEN_RULES = [
+  { code: "CIT-FIRE", match: /fire|wildfire|smoke|brush/i },
+  { code: "CIT-MED", match: /medical|ems|cardiac|overdose|injur/i },
+  { code: "CIT-TRAFFIC", match: /traffic|crash|collision|vehicle|hit and run/i },
+  { code: "CIT-POLICE", match: /police|shoot|robber|assault|burglar|pursuit|weapon|stabb/i }
+];
+
+/** Citizen's own label mapped onto a dispatch call type, or null to drop it. */
+export function citizenCallType(label) {
+  if (!label) return null;
+  for (const rule of CITIZEN_RULES) {
+    if (rule.match.test(String(label))) return rule.code;
+  }
+  return null;
+}
+
+function citizenVarint(buf, pos) {
+  let value = 0, shift = 0, byte;
+  while (pos < buf.length) {
+    byte = buf[pos++];
+    value += (byte & 127) * Math.pow(2, shift);
+    if ((byte & 128) === 0) return { value, pos };
+    shift += 7;
+    if (shift > 49) return null;
+  }
+  return null;
+}
+
+function citizenFields(buf, start, end) {
+  const out = [];
+  let pos = start;
+  while (pos < end) {
+    const tag = citizenVarint(buf, pos);
+    if (!tag) break;
+    pos = tag.pos;
+    const field = Math.floor(tag.value / 8);
+    const wire = tag.value % 8;
+    if (wire === 0) {
+      const num = citizenVarint(buf, pos);
+      if (!num) break;
+      out.push({ field, wire, num: num.value });
+      pos = num.pos;
+    } else if (wire === 2) {
+      const len = citizenVarint(buf, pos);
+      if (!len) break;
+      const stop = len.pos + len.value;
+      if (stop > end) break;
+      out.push({ field, wire, bytes: buf.subarray(len.pos, stop) });
+      pos = stop;
+    } else if (wire === 1) {
+      pos += 8;
+    } else if (wire === 5) {
+      pos += 4;
+    } else {
+      break;
+    }
+  }
+  return out;
+}
+
+/**
+ * Read a Mapbox vector tile down to its feature properties. Only the fields
+ * this source needs are decoded: geometry and numeric attributes are skipped.
+ */
+export function readCitizenTile(bytes) {
+  const buf = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  const decoder = new TextDecoder("utf-8");
+  const features = [];
+  for (const top of citizenFields(buf, 0, buf.length)) {
+    if (top.field !== 3 || top.wire !== 2) continue;
+    const layerBytes = top.bytes;
+    const keys = [];
+    const values = [];
+    const rawFeatures = [];
+    for (const f of citizenFields(layerBytes, 0, layerBytes.length)) {
+      if (f.field === 2 && f.wire === 2) rawFeatures.push(f.bytes);
+      else if (f.field === 3 && f.wire === 2) keys.push(decoder.decode(f.bytes));
+      else if (f.field === 4 && f.wire === 2) {
+        let text = null;
+        for (const v of citizenFields(f.bytes, 0, f.bytes.length)) {
+          if (v.field === 1 && v.wire === 2) text = decoder.decode(v.bytes);
+        }
+        values.push(text);
+      }
+    }
+    for (const featureBytes of rawFeatures) {
+      const tags = [];
+      for (const f of citizenFields(featureBytes, 0, featureBytes.length)) {
+        if (f.field !== 2) continue;
+        if (f.wire === 2) {
+          let pos = 0;
+          while (pos < f.bytes.length) {
+            const v = citizenVarint(f.bytes, pos);
+            if (!v) break;
+            tags.push(v.value);
+            pos = v.pos;
+          }
+        } else if (f.wire === 0) {
+          tags.push(f.num);
+        }
+      }
+      const props = {};
+      for (let i = 0; i + 1 < tags.length; i += 2) {
+        const key = keys[tags[i]];
+        const value = values[tags[i + 1]];
+        if (key && value != null) props[key] = value;
+      }
+      if (props.incident_id) features.push(props);
+    }
+  }
+  return features;
+}
+
+function citizenTimeMs(detail) {
+  const updates = detail && detail.updates;
+  if (Array.isArray(updates)) {
+    let best = null;
+    for (const u of updates) {
+      const ts = Number(u && u.ts);
+      if (Number.isFinite(ts) && ts > 0 && (best === null || ts < best)) best = ts;
+    }
+    if (best !== null) return best;
+  }
+  const expanded = Number(detail && detail.expandedAtMs);
+  if (Number.isFinite(expanded) && expanded > 0) return expanded;
+  return Date.now();
+}
+
+function citizenRow(detail, code) {
+  const type = CITIZEN_TYPES[code];
+  if (!type) return null;
+  const details = (detail && detail.locationDetails) || {};
+  const pos = (detail && detail.position) || details.coordinates || {};
+  const lat = Number(pos.latitude);
+  const lng = Number(pos.longitude);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng) || !inBBox(lat, lng)) return null;
+  const address = (detail && detail.location) || details.streetAddress || details.formattedAddress || "";
+  if (!String(address).trim()) return null;
+  const incidentId = String((detail && detail.incidentId) || "");
+  if (!incidentId) return null;
+  const when = new Date(citizenTimeMs(detail)).toISOString();
+  const area = String(details.serviceAreaCode || "").toUpperCase();
+  return {
+    call_date_raw: when,
+    call_date: when,
+    agency: "CITIZEN",
+    call_no: "CIT:" + incidentId,
+    report_no: "",
+    call_type: code,
+    call_type_desc: type.desc,
+    category: type.category,
+    severity: type.severity,
+    dispo: (detail && detail.lifecycleState) || "",
+    location: String(address).trim(),
+    county: area.indexOf("RIVERSIDE") >= 0 ? "RC" : "SB",
+    lat,
+    lng,
+    geo_source: "citizen",
+    source: "citizen"
+  };
+}
+
+async function citizenFetchJson(url) {
+  const resp = await fetch(url, {
+    headers: { Accept: "application/json", "User-Agent": CITIZEN_UA },
+    signal: AbortSignal.timeout(12e3)
+  });
+  if (!resp.ok) return null;
+  const data = await resp.json();
+  if (typeof data === "string") {
+    try { return JSON.parse(data); } catch (e) { return null; }
+  }
+  return data;
+}
+
+async function scrapeCitizen(env) {
+  const results = [];
+  const errors = [];
+  const now = Date.now();
+  let lastPoll = null;
+  try { lastPoll = Number(await env.DISPATCH_KV.get("citizen:last_poll")); } catch (e) {}
+  if (Number.isFinite(lastPoll) && lastPoll > 0 && now - lastPoll < CITIZEN_POLL_GAP_MS) {
+    return { results, errors, skipped: true };
+  }
+  try { await env.DISPATCH_KV.put("citizen:last_poll", String(now), { expirationTtl: 3600 }); } catch (e) {}
+
+  // Rotate which tiles are polled so the far corners of the county get covered
+  // without asking for all of them on every run.
+  const offset = Math.floor(now / CITIZEN_POLL_GAP_MS) % CITIZEN_TILES.length;
+  const batch = [];
+  const take = Math.min(CITIZEN_MAX_TILES, CITIZEN_TILES.length);
+  for (let i = 0; i < take; i++) batch.push(CITIZEN_TILES[(offset + i) % CITIZEN_TILES.length]);
+
+  const seen = new Set();
+  const candidates = [];
+  for (const tile of batch) {
+    try {
+      const resp = await fetch(
+        CITIZEN_API + "/v1/tile/incidents/" + tile.x + "/" + tile.y + "/" + tile.z + ".pbf",
+        {
+          headers: { Accept: "application/x-protobuf", "User-Agent": CITIZEN_UA },
+          signal: AbortSignal.timeout(12e3)
+        }
+      );
+      if (!resp.ok) {
+        errors.push({ tile: tile.x + "/" + tile.y + "/" + tile.z, error: "HTTP " + resp.status });
+        continue;
+      }
+      const parsed = readCitizenTile(new Uint8Array(await resp.arrayBuffer()));
+      for (const props of parsed) {
+        const id = String(props.incident_id || "");
+        if (!id || seen.has(id)) continue;
+        seen.add(id);
+        const code = citizenCallType(props.category);
+        if (!code) continue;
+        candidates.push({ id, code });
+      }
+    } catch (err) {
+      errors.push({ tile: tile.x + "/" + tile.y + "/" + tile.z, error: err.message });
+    }
+  }
+
+  let hydrated = 0;
+  for (const item of candidates) {
+    if (hydrated >= CITIZEN_MAX_DETAILS) break;
+    try {
+      if (await env.DISPATCH_KV.get("citizen_seen:" + item.id)) continue;
+    } catch (e) {}
+    hydrated++;
+    try {
+      await new Promise((r) => setTimeout(r, 1200));
+      const detail = await citizenFetchJson(CITIZEN_API + "/v3/incident/" + encodeURIComponent(item.id));
+      if (!detail) {
+        errors.push({ id: item.id, error: "detail unavailable" });
+        continue;
+      }
+      const row = citizenRow(detail, item.code);
+      if (!row) continue;
+      results.push(row);
+      try {
+        await env.DISPATCH_KV.put("citizen_seen:" + item.id, "1", { expirationTtl: 21600 });
+      } catch (e) {}
+    } catch (err) {
+      errors.push({ id: item.id, error: err.message });
+    }
+  }
+  return { results, errors, candidates: candidates.length, hydrated };
+}
+__name(scrapeCitizen, "scrapeCitizen");
 async function runScraper(env) {
   const startTime = Date.now();
   const { results: aspNetResults, errors: aspNetErrors } = await scrapeAspNet(env);
   const wpResults = await scrapeWordPress(env);
   const { results: rcResults, errors: rcErrors } = await scrapeRiversideCounty(env);
+  let citizenResults = [], citizenErrors = [];
+  try {
+    const citizen = await scrapeCitizen(env);
+    citizenResults = citizen.results || [];
+    citizenErrors = citizen.errors || [];
+  } catch (err) {
+    citizenErrors = [{ error: err.message }];
+  }
   let totalRows = 0;
   for (const rows of Object.values(aspNetResults)) totalRows += rows.length;
   totalRows += wpResults.length;
   totalRows += rcResults.length;
+  totalRows += citizenResults.length;
   return {
     aspNet: aspNetResults,
     aspNetErrors,
     wordpress: wpResults,
     riverside: rcResults,
     riversideErrors: rcErrors,
+    citizen: citizenResults,
+    citizenErrors,
     stats: {
       agencies_scraped: Object.keys(aspNetResults).length,
       total_rows: totalRows,
       aspNet_errors: aspNetErrors.length,
       wp_rows: wpResults.length,
       rc_rows: rcResults.length,
+      citizen_rows: citizenResults.length,
+      citizen_errors: citizenErrors.length,
       rc_errors: rcErrors.length,
       duration_ms: Date.now() - startTime,
       scraped_at: (/* @__PURE__ */ new Date()).toISOString()
@@ -851,7 +1149,7 @@ function normalizeRecord(raw) {
   return {
     call_date: callDate,
     call_type: raw.call_type || "",
-    call_type_desc: ct?.desc || "Unknown",
+    call_type_desc: raw.call_type_desc || ct?.desc || "Unknown",
     location: raw.location || "",
     location_clean: cleaned,
     agency: raw.agency || "",
@@ -860,8 +1158,8 @@ function normalizeRecord(raw) {
     report_no: raw.report_no || "",
     dispo: raw.dispo || "",
     dispo_desc: dp?.desc || "Unknown",
-    severity: ct?.severity || "unknown",
-    category: ct?.category || "Unknown",
+    severity: raw.severity || ct?.severity || "unknown",
+    category: raw.category || ct?.category || "Unknown",
     source: raw.source || (isRc ? "riverside_api" : "aspnet"),
     county: raw.county || "SB"
   };
@@ -912,6 +1210,9 @@ async function processScrapeResults(env, scrapeResults) {
   for (const row of scrapeResults.riverside || []) {
     allRecords.push(row);
   }
+  for (const row of scrapeResults.citizen || []) {
+    allRecords.push(row);
+  }
   let stored = 0, skipped = 0;
   const latestByAgency = {};
   const pendingGeo = [];
@@ -923,10 +1224,14 @@ async function processScrapeResults(env, scrapeResults) {
       const hash = contentHash(normalized);
       const enriched = { ...normalized, hash, geocoded: null, scraped_at: scrapeResults.stats.scraped_at || (/* @__PURE__ */ new Date()).toISOString() };
       latestByAgency[record.agency] = enriched;
-      return { normalized, hash, enriched };
+      const hasCoords = Number.isFinite(Number(record.lat)) && Number.isFinite(Number(record.lng));
+      const coords = hasCoords
+        ? { lat: Number(record.lat), lng: Number(record.lng), source: record.geo_source || "source" }
+        : null;
+      return { normalized, hash, enriched, coords };
     });
     const stmts = items.map(
-      ({ normalized, hash, enriched }) => env.DISPATCH_D1.prepare(
+      ({ normalized, hash, enriched, coords }) => env.DISPATCH_D1.prepare(
         `INSERT OR IGNORE INTO dispatch_calls
          (hash, call_date, call_type, call_type_desc, location, location_clean,
           agency, call_no, report_no, dispo, dispo_desc, severity, category, raw_json, scraped_at, county,
@@ -949,10 +1254,10 @@ async function processScrapeResults(env, scrapeResults) {
         JSON.stringify(enriched),
         enriched.scraped_at,
         normalized.county || "SB",
-        null,
-        null,
-        null,
-        null
+        coords ? coords.lat : null,
+        coords ? coords.lng : null,
+        coords ? coords.source : null,
+        coords ? enriched.scraped_at : null
       )
     );
     try {
@@ -960,7 +1265,7 @@ async function processScrapeResults(env, scrapeResults) {
       for (let j = 0; j < results.length; j++) {
         if (results[j].meta?.changes > 0) {
           stored++;
-          pendingGeo.push({
+          if (!items[j].coords) pendingGeo.push({
             hash: items[j].hash,
             agency: items[j].normalized.agency,
             location_clean: items[j].normalized.location_clean
@@ -1297,7 +1602,7 @@ __name(handleListBackups, "handleListBackups");
 
 async function handleDuplicateAnalysis(env) {
   const rows = await env.DISPATCH_D1.prepare(
-    "SELECT hash, call_date, agency, location, call_type, call_type_desc FROM dispatch_calls ORDER BY call_date DESC LIMIT 5000"
+    "SELECT hash, call_date, agency, location, call_type, call_type_desc FROM dispatch_calls WHERE agency <> 'CITIZEN' ORDER BY call_date DESC LIMIT 5000"
   ).all();
   const records = rows.results || [];
   const byLocation = {};
@@ -2154,7 +2459,7 @@ async function handleDiscover(env) {
 __name(handleDiscover, "handleDiscover");
 var STATIC_ASSETS = {
   "/icon.svg": { content: "\"<svg xmlns=\\\"http://www.w3.org/2000/svg\\\" width=\\\"512\\\" height=\\\"512\\\" viewBox=\\\"0 0 512 512\\\"><rect width=\\\"512\\\" height=\\\"512\\\" rx=\\\"80\\\" fill=\\\"#1a1a2e\\\"/><text x=\\\"256\\\" y=\\\"340\\\" font-size=\\\"280\\\" text-anchor=\\\"middle\\\" fill=\\\"#e94560\\\" font-family=\\\"sans-serif\\\" font-weight=\\\"bold\\\">S</text></svg>\"", contentType: "image/svg+xml" },
-  "/sw.js": { content: "const CACHE = 'sb-dispatch-v6';\nconst STATIC = ['/','/index.html','/css/dashboard.css','/js/app.js','/js/cards.js','/js/map.js','/js/deepdive.js','/js/app-data.js','/manifest.json'];\nself.addEventListener('install', e => { self.skipWaiting(); e.waitUntil(caches.open(CACHE).then(c => c.addAll(STATIC).catch(() => {}))); });\nself.addEventListener('activate', e => e.waitUntil(caches.keys().then(function(ks){return Promise.all(ks.filter(function(k){return k !== CACHE;}).map(function(k){return caches.delete(k);}));}).then(function(){return self.clients.claim();})));\nself.addEventListener('fetch', e => {\n  const url = new URL(e.request.url);\n  if (url.pathname.startsWith('/api/')) {\n    e.respondWith(fetch(e.request).then(r => { const c = r.clone(); caches.open(CACHE).then(c2 => c2.put(e.request, c)); return r; }).catch(() => caches.match(e.request)));\n  } else {\n    e.respondWith(caches.match(e.request).then(r => r || fetch(e.request).then(res => { const c = res.clone(); caches.open(CACHE).then(c2 => c2.put(e.request, c)); return res; }).catch(() => caches.match('/'))));\n  }\n});", contentType: "application/javascript" },
+  "/sw.js": { content: "const CACHE = 'sb-dispatch-v7';\nconst STATIC = ['/','/index.html','/css/dashboard.css','/js/app.js','/js/cards.js','/js/map.js','/js/deepdive.js','/js/app-data.js','/manifest.json'];\nself.addEventListener('install', e => { self.skipWaiting(); e.waitUntil(caches.open(CACHE).then(c => c.addAll(STATIC).catch(() => {}))); });\nself.addEventListener('activate', e => e.waitUntil(caches.keys().then(function(ks){return Promise.all(ks.filter(function(k){return k !== CACHE;}).map(function(k){return caches.delete(k);}));}).then(function(){return self.clients.claim();})));\nself.addEventListener('fetch', e => {\n  const url = new URL(e.request.url);\n  if (url.pathname.startsWith('/api/')) {\n    e.respondWith(fetch(e.request).then(r => { const c = r.clone(); caches.open(CACHE).then(c2 => c2.put(e.request, c)); return r; }).catch(() => caches.match(e.request)));\n  } else {\n    e.respondWith(caches.match(e.request).then(r => r || fetch(e.request).then(res => { const c = res.clone(); caches.open(CACHE).then(c2 => c2.put(e.request, c)); return res; }).catch(() => caches.match('/'))));\n  }\n});", contentType: "application/javascript" },
   "/manifest.json": { content: "{\"id\":\"/\",\"name\":\"SB County Dispatch\",\"short_name\":\"SB Dispatch\",\"description\":\"Real-time San Bernardino County dispatch calls\",\"start_url\":\"/\",\"display\":\"standalone\",\"background_color\":\"#1a1a2e\",\"theme_color\":\"#1a1a2e\",\"icons\":[{\"src\":\"/icon.svg\",\"sizes\":\"any\",\"type\":\"image/svg+xml\",\"purpose\":\"any\"},{\"src\":\"/icon.svg\",\"sizes\":\"512x512\",\"type\":\"image/svg+xml\",\"purpose\":\"maskable\"}],\"screenshots\":[{\"src\":\"/icon.svg\",\"sizes\":\"1280x720\",\"type\":\"image/svg+xml\",\"form_factor\":\"wide\",\"label\":\"SB County Dispatch Dashboard\"},{\"src\":\"/icon.svg\",\"sizes\":\"512x1024\",\"type\":\"image/svg+xml\",\"label\":\"SB County Dispatch Mobile\"}]}", contentType: "application/manifest+json" },
   "/js/app-data.js": { content: `export const APP_DATA = ${JSON.stringify(WEB_DATA)};
 `, type: "application/javascript" },
