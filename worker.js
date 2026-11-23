@@ -1550,10 +1550,26 @@ async function geocodePendingRecords(env, pendingGeo, budget = 40) {
   };
 }
 __name(geocodePendingRecords, "geocodePendingRecords");
+var CORS_ALLOW_METHODS = "GET, POST, OPTIONS";
+var CORS_ALLOW_HEADERS = "Content-Type, X-Owner-Key";
+var CORS_MAX_AGE_SECONDS = "86400";
+function corsHeaders() {
+  return {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": CORS_ALLOW_METHODS,
+    "Access-Control-Allow-Headers": CORS_ALLOW_HEADERS,
+    "Access-Control-Max-Age": CORS_MAX_AGE_SECONDS
+  };
+}
+__name(corsHeaders, "corsHeaders");
+function corsPreflight() {
+  return new Response(null, { status: 204, headers: corsHeaders() });
+}
+__name(corsPreflight, "corsPreflight");
 function json(data, status = 200, extraHeaders = {}) {
   return new Response(JSON.stringify(data), {
     status,
-    headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*", ...extraHeaders }
+    headers: { "Content-Type": "application/json", ...corsHeaders(), ...extraHeaders }
   });
 }
 __name(json, "json");
@@ -1798,6 +1814,7 @@ async function handleRouteAlerts(request, env) {
 __name(handleRouteAlerts, "handleRouteAlerts");
 
 async function handleApi(request, env, ctx) {
+  if (request.method === "OPTIONS") return corsPreflight();
   const url = new URL(request.url);
   const path = url.pathname;
   if (path === "/api/dispatch") return handleDispatchQuery(request, env);

@@ -98,6 +98,7 @@ will report the old values.
 | `HANDOFF.md` | current state, what changed, what is verified and what is open |
 | `worker.js` | the whole Worker: scraper, storage, geocoding, API, inlined site |
 | `wrangler.jsonc` | bindings and cron, reproducing the deployed Worker |
+| `API-GUIDE.md` | every binding, KV/D1/R2 layout and route, with snippets and the UI's card calls |
 | `test/health.test.mjs` | the reporting count rule behind `/api/health` |
 | `test/cadence.test.mjs` | the next-run scheduling rule |
 | `test/reports.test.mjs` | the report rules: categories, county box, note cleaning, county match, owner key |
