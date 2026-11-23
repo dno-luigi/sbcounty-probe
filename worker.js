@@ -676,14 +676,40 @@ __name(parseHtmlTable, "parseHtmlTable");
 async function scrapeAspNet(env) {
   const results = {};
   const errors = [];
-  const initResp = await fetch(ASPNET_URL, {
-    headers: { "User-Agent": "Mozilla/5.0 (compatible; SBCountyScraper/1.0)" },
-    signal: AbortSignal.timeout(1e4)
-  });
+  // The initial page load is the one request in this source that cannot be
+  // retried per agency: without its VIEWSTATE every POST below is rejected. One
+  // bounded retry keeps a transient timeout from ending the whole run, and a
+  // second failure is reported as an ALL-agency error so the other sources still
+  // get their turn. An unhandled timeout here aborted the 2026-11-22T23:39Z run
+  // at 11s, before storage, geocoding or retention could run.
+  let initResp = null;
+  let initError = "";
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      initResp = await fetch(ASPNET_URL, {
+        headers: { "User-Agent": "Mozilla/5.0 (compatible; SBCountyScraper/1.0)" },
+        signal: AbortSignal.timeout(1e4)
+      });
+      break;
+    } catch (err) {
+      initError = (err && err.message) || String(err);
+      initResp = null;
+    }
+  }
+  if (!initResp) {
+    errors.push({ agency: "ALL", error: "Initial page failed: " + initError });
+    return { results, errors };
+  }
   if (initResp.status === 429) { await env.DISPATCH_KV.put('meta:rate_limited', JSON.stringify(Date.now())); return { results: {}, errors: [{ agency: 'ALL', error: 'Rate limited (429) by source site' }] }; }
   const setCookies = initResp.headers.getSetCookie?.() || [];
   const antiXsrf = (setCookies.find((c) => c.startsWith("__AntiXsrfToken=")) || "").split(";")[0];
-  const initHtml = await initResp.text();
+  let initHtml = "";
+  try {
+    initHtml = await initResp.text();
+  } catch (err) {
+    errors.push({ agency: "ALL", error: "Initial page body failed: " + ((err && err.message) || String(err)) });
+    return { results, errors };
+  }
   let viewState = extractToken(initHtml, "__VIEWSTATE");
   let viewStateGen = extractToken(initHtml, "__VIEWSTATEGENERATOR");
   let eventValidation = extractToken(initHtml, "__EVENTVALIDATION");
@@ -727,7 +753,8 @@ async function scrapeWordPress(env) {
   while (hasMore && page <= 20) {
     try {
       const resp = await fetch(`${WP_BASE}/pages?per_page=100&page=${page}&_fields=id,title,content`, {
-        headers: { "User-Agent": "Mozilla/5.0 (compatible; SBCountyScraper/1.0)" }
+        headers: { "User-Agent": "Mozilla/5.0 (compatible; SBCountyScraper/1.0)" },
+        signal: AbortSignal.timeout(15e3)
       });
       if (!resp.ok) break;
       const data = await resp.json();
@@ -1162,9 +1189,36 @@ async function scrapeCitizen(env) {
 __name(scrapeCitizen, "scrapeCitizen");
 async function runScraper(env) {
   const startTime = Date.now();
-  const { results: aspNetResults, errors: aspNetErrors } = await scrapeAspNet(env);
-  const wpResults = await scrapeWordPress(env);
-  const { results: rcResults, errors: rcErrors } = await scrapeRiversideCounty(env);
+  // Every source is isolated here. Each scraper already contains its own
+  // per-agency or per-station failures, but an unexpected throw (a timeout on a
+  // request it does not wrap, a parse bug) used to reject runScraper() and skip
+  // storage, geocoding and retention entirely. A source that dies now costs only
+  // its own rows for one cycle.
+  let aspNetResults = {}, aspNetErrors = [];
+  try {
+    const aspNet = await scrapeAspNet(env);
+    aspNetResults = aspNet.results || {};
+    aspNetErrors = aspNet.errors || [];
+  } catch (err) {
+    aspNetErrors = [{ agency: "ALL", error: err.message }];
+  }
+  let wpResults = [];
+  try {
+    wpResults = await scrapeWordPress(env) || [];
+  } catch (err) {
+    // scrapeWordPress has no error channel in the run payload - it already
+    // swallows per-page failures the same way - so containment is the whole
+    // fix here: an empty result shows up as wp_rows: 0.
+    wpResults = [];
+  }
+  let rcResults = [], rcErrors = [];
+  try {
+    const rc = await scrapeRiversideCounty(env);
+    rcResults = rc.results || [];
+    rcErrors = rc.errors || [];
+  } catch (err) {
+    rcErrors = [{ station: "ALL", error: err.message }];
+  }
   let citizenResults = [], citizenErrors = [];
   try {
     const citizen = await scrapeCitizen(env);
