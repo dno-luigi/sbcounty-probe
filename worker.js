@@ -701,6 +701,16 @@ async function scrapeAspNet(env) {
     return { results, errors };
   }
   if (initResp.status === 429) { await env.DISPATCH_KV.put('meta:rate_limited', JSON.stringify(Date.now())); return { results: {}, errors: [{ agency: 'ALL', error: 'Rate limited (429) by source site' }] }; }
+  // Any other non-OK initial load is a source-level failure too: the error page
+  // carries no VIEWSTATE and no __AntiXsrfToken, so every POST below would be
+  // rejected on its own and the run would report one error per agency — 34
+  // reflections of this single failure, with nothing pointing at the init. Report
+  // it once, in the same shape as the timeout and body-failure paths above, and
+  // skip the loop.
+  if (!initResp.ok) {
+    errors.push({ agency: "ALL", error: "Initial page HTTP " + initResp.status });
+    return { results, errors };
+  }
   const setCookies = initResp.headers.getSetCookie?.() || [];
   const antiXsrf = (setCookies.find((c) => c.startsWith("__AntiXsrfToken=")) || "").split(";")[0];
   let initHtml = "";
@@ -731,6 +741,17 @@ async function scrapeAspNet(env) {
         body: body.toString(),
         signal: AbortSignal.timeout(1e4)
       });
+      if (!resp.ok) {
+        // A rejected POST comes back as an error page, which parses to zero rows.
+        // Without this check that failure is indistinguishable from an agency
+        // with nothing to report: the run stores an empty bucket and no error.
+        // The site answers 500 when the __AntiXsrfToken cookie is missing or its
+        // session is refused, which is exactly how the 03:04Z/03:07Z runs lost
+        // 26 agencies while /api/health still reported errors: 0.
+        errors.push({ code, error: `HTTP ${resp.status}` });
+        results[code] = [];
+        continue;
+      }
       const html = await resp.text();
       const newVS = extractToken(html, "__VIEWSTATE");
       const newEV = extractToken(html, "__EVENTVALIDATION");
@@ -1240,6 +1261,11 @@ async function runScraper(env) {
     riversideErrors: rcErrors,
     citizen: citizenResults,
     citizenErrors,
+    // One list for the run payload. scheduled() records `scrapeResults.errors` as
+    // meta:source_health's error count and details, but the three per-source lists
+    // were never merged into it, so /api/health reported errors: 0 no matter which
+    // sources failed and the 10-entry error_details always stayed empty.
+    errors: [...aspNetErrors, ...rcErrors, ...citizenErrors],
     stats: {
       agencies_scraped: Object.keys(aspNetResults).length,
       total_rows: totalRows,
