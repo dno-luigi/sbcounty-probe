@@ -21,6 +21,10 @@
     { "binding": "DISPATCH_R2", "bucket_name": "sbclog" }
   ],
 
+  // What cods holds: the archive of answered questions, read by every app rather than
+  // copied into each one.
+  "services": [{ "binding": "CODS", "service": "cods" }],
+
   // Every minute; scheduled() decides whether to scrape fast or slow.
   "triggers": { "crons": ["*/1 * * * *"] }
 }

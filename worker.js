@@ -1893,10 +1893,36 @@ async function handleRouteAlerts(request, env) {
 }
 __name(handleRouteAlerts, "handleRouteAlerts");
 
+
+// The one client for what cods holds: whether this has been answered before. The
+// app's own records stay in its own store; this carries the words.
+async function codsRecall(env, query) {
+  if (!env || !env.CODS) return { ok: false, error: "cods_unbound" };
+  const params = new URLSearchParams();
+  if (query && query.text) params.set("text", String(query.text).slice(0, 400));
+  if (query && query.surface) params.set("surface", String(query.surface));
+  try {
+    const res = await env.CODS.fetch("https://cods/archive?" + params.toString());
+    const data = await res.json().catch(() => null);
+    if (!res.ok) return { ok: false, error: (data && data.error) || "cods_" + res.status };
+    return { ok: true, match: (data && data.match) || null, count: (data && data.count) || 0 };
+  } catch (error) {
+    return { ok: false, error: "cods_unreachable" };
+  }
+}
+
+async function handleRecall(request, env) {
+  const url = new URL(request.url);
+  const q = String(url.searchParams.get("q") || "").trim();
+  if (!q) return json({ error: "Add ?q=" }, 400);
+  return json(await codsRecall(env, { text: q, surface: url.searchParams.get("surface") || null }));
+}
+
 async function handleApi(request, env, ctx) {
   if (request.method === "OPTIONS") return corsPreflight();
   const url = new URL(request.url);
   const path = url.pathname;
+  if (path === "/api/recall") return handleRecall(request, env);
   if (path === "/api/dispatch") return handleDispatchQuery(request, env);
   if (path === "/api/dispatch/latest") return handleLatest(request, env);
   if (path === "/api/dispatch/agencies") return handleAgencies(env);
